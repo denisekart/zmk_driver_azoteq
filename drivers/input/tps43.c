@@ -247,6 +247,12 @@ static int tps43_set_suspend_internal(const struct device *dev, bool suspend, bo
         }
     }
 
+    // Release touch if device is suspended while touching was active
+    if (suspend && drv_data->touching) {
+        drv_data->touching = false;
+        input_report_key(dev, INPUT_BTN_TOUCH, 0, true, K_FOREVER);
+    }
+
     // Disable RDY interrupts when entering suspend (before any I2C operations)
     // This prevents race condition when RDY fires between suspend attempt and flag setting
     if (suspend && config->rdy_gpio.port != NULL) {
@@ -591,9 +597,15 @@ done:
 static int tps43_reset_values(const struct device *dev) {
     struct tps43_drv_data *drv_data = dev->data;
 
+    if (drv_data->touching) {
+        drv_data->touching = false;
+        input_report_key(dev, INPUT_BTN_TOUCH, 0, true, K_FOREVER);
+    }
+
     drv_data->device_ready = false;
     drv_data->initialized = false;
     drv_data->drag_active = false;
+    drv_data->touching = false;
     drv_data->three_finger_tap_eligible = false;
     drv_data->three_finger_swipe_fired = false;
     drv_data->three_finger_start_time_ms = 0;
@@ -1489,6 +1501,7 @@ static int tps43_init(const struct device *dev) {
         .initialized = false,                                                                        \
         .drag_active = false,                                                                        \
         .suspended = false,                                                                          \
+        .touching = false,                                                                           \
         .three_finger_start_time_ms = 0,                                                             \
         .three_finger_accum_dx = 0,                                                                  \
         .three_finger_accum_dy = 0,                                                                  \
