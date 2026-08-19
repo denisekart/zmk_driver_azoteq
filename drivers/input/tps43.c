@@ -346,6 +346,11 @@ static void tps43_handle_swipe(const struct device *dev, uint8_t num_fingers, in
         drv_data->last_three_finger_swipe_ms = now;
     }
 
+    if (num_fingers == 3) {
+        drv_data->three_finger_swipe_fired = true;
+        drv_data->three_finger_tap_eligible = false;
+    }
+
     if (rel_x < 0) {
         LOG_INF("%d-finger swipe left - INPUT_BTN_WEST", num_fingers);
         input_report_key(dev, INPUT_BTN_WEST, 1, true, K_FOREVER);
@@ -521,6 +526,50 @@ static void tps43_work_handler(struct k_work *work) {
         }
     }
 
+    /* --- Three-finger tap handling --- */
+    if (config->three_finger_tap) {
+        // Transition: Started 3-finger contact
+        if (num_fingers == 3) {
+            if (drv_data->prev_num_fingers != 3 && !drv_data->three_finger_swipe_fired) {
+                drv_data->three_finger_start_time_ms = k_uptime_get();
+                drv_data->three_finger_accum_dx = 0;
+                drv_data->three_finger_accum_dy = 0;
+                drv_data->three_finger_tap_eligible = true;
+            } else if (drv_data->three_finger_tap_eligible) {
+                drv_data->three_finger_accum_dx += rel_x;
+                drv_data->three_finger_accum_dy += rel_y;
+
+                int64_t elapsed = k_uptime_get() - drv_data->three_finger_start_time_ms;
+                if (elapsed > config->three_finger_tap_time_ms ||
+                    abs(drv_data->three_finger_accum_dx) > config->three_finger_tap_max_distance ||
+                    abs(drv_data->three_finger_accum_dy) > config->three_finger_tap_max_distance) {
+                    drv_data->three_finger_tap_eligible = false;
+                }
+            }
+        }
+
+        // Transition: Lift-off from 3 fingers (num_fingers < 3 after being 3)
+        if (drv_data->prev_num_fingers == 3 && num_fingers < 3) {
+            if (drv_data->three_finger_tap_eligible && !drv_data->three_finger_swipe_fired) {
+                int64_t elapsed = k_uptime_get() - drv_data->three_finger_start_time_ms;
+                if (elapsed <= config->three_finger_tap_time_ms) {
+                    LOG_INF("Three finger tap -> MIDDLE BUTTON (INPUT_BTN_2)");
+                    input_report_key(dev, INPUT_BTN_2, 1, true, K_FOREVER);
+                    input_report_key(dev, INPUT_BTN_2, 0, true, K_FOREVER);
+                }
+            }
+            drv_data->three_finger_tap_eligible = false;
+        }
+
+        // Reset swipe latch when all fingers are lifted
+        if (num_fingers == 0) {
+            drv_data->three_finger_swipe_fired = false;
+            drv_data->three_finger_tap_eligible = false;
+        }
+    }
+
+    drv_data->prev_num_fingers = num_fingers;
+
 done:
     // Save for next call
     drv_data->drag_active = is_drag_active;
@@ -545,6 +594,12 @@ static int tps43_reset_values(const struct device *dev) {
     drv_data->device_ready = false;
     drv_data->initialized = false;
     drv_data->drag_active = false;
+    drv_data->three_finger_tap_eligible = false;
+    drv_data->three_finger_swipe_fired = false;
+    drv_data->three_finger_start_time_ms = 0;
+    drv_data->three_finger_accum_dx = 0;
+    drv_data->three_finger_accum_dy = 0;
+    drv_data->prev_num_fingers = 0;
 
     LOG_INF("Values reset");
     return 0;
@@ -1434,6 +1489,12 @@ static int tps43_init(const struct device *dev) {
         .initialized = false,                                                                        \
         .drag_active = false,                                                                        \
         .suspended = false,                                                                          \
+        .three_finger_start_time_ms = 0,                                                             \
+        .three_finger_accum_dx = 0,                                                                  \
+        .three_finger_accum_dy = 0,                                                                  \
+        .three_finger_tap_eligible = false,                                                          \
+        .three_finger_swipe_fired = false,                                                           \
+        .prev_num_fingers = 0,                                                                       \
     };                                                                                               \
                                                                                                      \
     static const struct tps43_config tps43_##inst##_config = {                                       \
@@ -1443,6 +1504,9 @@ static int tps43_init(const struct device *dev) {
         .single_tap = DT_INST_PROP(inst, single_tap),                                                \
         .press_and_hold = DT_INST_PROP(inst, press_and_hold),                                        \
         .two_finger_tap = DT_INST_PROP(inst, two_finger_tap),                                        \
+        .three_finger_tap = DT_INST_PROP(inst, three_finger_tap),                                    \
+        .three_finger_tap_time_ms = DT_INST_PROP_OR(inst, three_finger_tap_time_ms, 250),            \
+        .three_finger_tap_max_distance = DT_INST_PROP_OR(inst, three_finger_tap_max_distance, 15),   \
         .scroll = DT_INST_PROP(inst, scroll),                                                        \
         .zoom = DT_INST_PROP(inst, zoom),                                                            \
         .swipes = DT_INST_PROP(inst, swipes),                                                        \

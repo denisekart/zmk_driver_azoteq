@@ -114,6 +114,27 @@ properties:
     required: false
     description: Enable two-finger tap gesture
 
+  three-finger-tap:
+    type: boolean
+    required: false
+    description: Enable three-finger tap gesture (maps to middle mouse button INPUT_BTN_2)
+
+  three-finger-tap-time-ms:
+    type: int
+    required: false
+    default: 250
+    description: >
+      Maximum duration in milliseconds for three fingers in contact to be recognized
+      as a tap gesture before being disqualified.
+
+  three-finger-tap-max-distance:
+    type: int
+    required: false
+    default: 15
+    description: >
+      Maximum cumulative displacement (in pixels) permitted during three-finger contact
+      for a tap gesture to register.
+
   scroll:
     type: boolean
     required: false

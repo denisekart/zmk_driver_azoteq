@@ -12,6 +12,7 @@ This driver should work with any IQS5XX-based trackpad (TPS43 or TPS65).
 - Touch reporting: finger contact is reported as `INPUT_BTN_TOUCH` (1 when one or more fingers are on the pad, 0 when all fingers are lifted).
 - Single tap: registered as left click.
 - Two-finger tap: registered as right click.
+- Three-finger tap: registered as middle click (INPUT_BTN_2 / INPUT_BTN_MIDDLE).
 - Press and hold: registered as continuous left click (drag).
 - Vertical and horizontal scrolling - Modern 'gesture based' two finger swiping
 - Left/right/up/down swipe send INPUT_BTN_WEST/EAST/NORTH/SOUTH events.  You can map them to other keys/actions as you wish in your dts file. (Either 3-finger or 1-finger directional swiping is supported)
@@ -71,6 +72,9 @@ CONFIG_INPUT_TPS43=y
 
         scroll;
         two-finger-tap;
+        // three-finger-tap;                    /* 3-finger tap (middle click INPUT_BTN_2) (optional) */
+        // three-finger-tap-time-ms=<250>;      /* Max duration in ms for 3-finger tap, default 250 (optional) */
+        // three-finger-tap-max-distance=<15>;  /* Max movement in px for 3-finger tap, default 15 (optional) */
         single-tap;
         press-and-hold;
         swipes;
