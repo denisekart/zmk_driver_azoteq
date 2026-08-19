@@ -393,6 +393,7 @@ static void tps43_work_handler(struct k_work *work) {
     bool is_scroll_active = false;
     bool is_zoom_active = false;
     bool is_drag_active = drv_data->drag_active;
+    bool was_tap_drag_active = drv_data->tap_drag_active;
     int ret;
 
     // If device is in suspend, ignore interrupt (RDY should be disabled)
@@ -437,14 +438,47 @@ static void tps43_work_handler(struct k_work *work) {
         input_report_key(dev, INPUT_BTN_TOUCH, is_touching ? 1 : 0, true, K_FOREVER);
     }
 
+    /* Tap-and-drag: check for 2nd contact down (0 -> 1 finger) */
+    if (config->tap_and_drag && drv_data->prev_num_fingers == 0 && num_fingers == 1) {
+        if (drv_data->tap_drag_state == TPS43_TAP_DRAG_FIRST_TAP) {
+            int64_t now = k_uptime_get();
+            if ((now - drv_data->tap_drag_up_time_ms) <= config->tap_and_drag_delay_ms) {
+                LOG_INF("Second tap contact within %d ms -> ENGAGE TAP-DRAG LOCK",
+                        config->tap_and_drag_delay_ms);
+                drv_data->tap_drag_state = TPS43_TAP_DRAG_ACTIVE;
+                drv_data->tap_drag_active = true;
+                input_report_key(dev, INPUT_BTN_0, 1, true, K_FOREVER);
+            } else {
+                drv_data->tap_drag_state = TPS43_TAP_DRAG_IDLE;
+            }
+        }
+    }
+
+    /* Multi-finger touch cancels any pending tap-drag or active tap-drag lock */
+    if (num_fingers > 1 && (drv_data->tap_drag_state != TPS43_TAP_DRAG_IDLE || drv_data->tap_drag_active)) {
+        if (drv_data->tap_drag_active) {
+            LOG_INF("Multi-finger touch -> RELEASE TAP-DRAG LEFT BUTTON");
+            input_report_key(dev, INPUT_BTN_0, 0, true, K_FOREVER);
+            drv_data->tap_drag_active = false;
+        }
+        drv_data->tap_drag_state = TPS43_TAP_DRAG_IDLE;
+    }
+
     if (gestures_events[0] != 0 || gestures_events[1] != 0) {
 
         LOG_INF("Gestures: Single=0x%02X, Multi=0x%02X", gestures_events[0], gestures_events[1]);
 
         if (gestures_events[0] & TPS43_SINGLE_TAP) {
-            LOG_INF("Single tap → LEFT BUTTON");
-            input_report_key(dev, INPUT_BTN_0, 1, true, K_FOREVER);
-            input_report_key(dev, INPUT_BTN_0, 0, true, K_FOREVER);
+            if (!was_tap_drag_active) {
+                LOG_INF("Single tap → LEFT BUTTON");
+                input_report_key(dev, INPUT_BTN_0, 1, true, K_FOREVER);
+                input_report_key(dev, INPUT_BTN_0, 0, true, K_FOREVER);
+
+                if (config->tap_and_drag) {
+                    drv_data->tap_drag_up_time_ms = k_uptime_get();
+                    drv_data->tap_drag_state = TPS43_TAP_DRAG_FIRST_TAP;
+                }
+            }
         }
         if (gestures_events[0] & (TPS43_SWIPE_UP | TPS43_SWIPE_DOWN | TPS43_SWIPE_LEFT | TPS43_SWIPE_RIGHT)) {
             LOG_INF("Single finger swipe");
@@ -455,7 +489,7 @@ static void tps43_work_handler(struct k_work *work) {
             input_report_key(dev, INPUT_BTN_1, 1, true, K_FOREVER);
             input_report_key(dev, INPUT_BTN_1, 0, true, K_FOREVER);
         }
-        if ((gestures_events[0] & TPS43_PRESS_AND_HOLD) && (!(is_drag_active))) {
+        if ((gestures_events[0] & TPS43_PRESS_AND_HOLD) && !is_drag_active && !drv_data->tap_drag_active) {
             LOG_INF("Press and hold detected - DRAG (HOLD LEFT BUTTON)");
             // set internal drag flag and press left mouse button
             is_drag_active = true;
@@ -477,6 +511,16 @@ static void tps43_work_handler(struct k_work *work) {
         // release drag flag and release left mouse button
         is_drag_active = false;
         input_report_key(dev, INPUT_BTN_0, 0, true, K_FOREVER);   // release + sync
+    }
+
+    /* Release tap-drag lock when contact is lost */
+    if (drv_data->prev_num_fingers > 0 && num_fingers == 0) {
+        if (drv_data->tap_drag_active) {
+            LOG_INF("Tap-drag contact lost -> RELEASE LEFT BUTTON");
+            drv_data->tap_drag_active = false;
+            drv_data->tap_drag_state = TPS43_TAP_DRAG_IDLE;
+            input_report_key(dev, INPUT_BTN_0, 0, true, K_FOREVER);
+        }
     }
 
     if (rel_x != 0 || rel_y != 0) {
@@ -594,6 +638,9 @@ static int tps43_reset_values(const struct device *dev) {
     drv_data->device_ready = false;
     drv_data->initialized = false;
     drv_data->drag_active = false;
+    drv_data->tap_drag_state = TPS43_TAP_DRAG_IDLE;
+    drv_data->tap_drag_up_time_ms = 0;
+    drv_data->tap_drag_active = false;
     drv_data->three_finger_tap_eligible = false;
     drv_data->three_finger_swipe_fired = false;
     drv_data->three_finger_start_time_ms = 0;
@@ -623,8 +670,8 @@ static int tps43_configure_device(const struct device *dev) {
     // write to TPS43_REG_SYSTEM_CONFIG_1 events to track
     uint8_t events_to_track = TPS43_TP_EVENT | TPS43_EVENT_MODE;
 
-    // Gestures (single_tap, press_and_hold, scroll, two_finger_tap)
-    if (config->single_tap || config->press_and_hold ||
+    // Gestures (single_tap, tap_and_drag, press_and_hold, scroll, two_finger_tap)
+    if (config->single_tap || config->tap_and_drag || config->press_and_hold ||
         config->scroll || config->two_finger_tap) {
         events_to_track |= TPS43_GESTURE_EVENT;
     }
@@ -651,9 +698,9 @@ static int tps43_configure_device(const struct device *dev) {
     }
 
     // enable single gestures at hardware level
-    if (config->single_tap || config->press_and_hold || config->swipes || config->three_finger_swipe) {
+    if (config->single_tap || config->tap_and_drag || config->press_and_hold || config->swipes || config->three_finger_swipe) {
         uint8_t single_gestures = 0;
-        single_gestures |= config->single_tap ? TPS43_SINGLE_TAP : 0;
+        single_gestures |= (config->single_tap || config->tap_and_drag) ? TPS43_SINGLE_TAP : 0;
         single_gestures |= config->press_and_hold ? TPS43_PRESS_AND_HOLD : 0;
         single_gestures |= config->swipes ? TPS43_SWIPE_UP : 0;
         single_gestures |= config->swipes ? TPS43_SWIPE_DOWN : 0;
@@ -1489,6 +1536,9 @@ static int tps43_init(const struct device *dev) {
         .initialized = false,                                                                        \
         .drag_active = false,                                                                        \
         .suspended = false,                                                                          \
+        .tap_drag_state = TPS43_TAP_DRAG_IDLE,                                                       \
+        .tap_drag_up_time_ms = 0,                                                                    \
+        .tap_drag_active = false,                                                                    \
         .three_finger_start_time_ms = 0,                                                             \
         .three_finger_accum_dx = 0,                                                                  \
         .three_finger_accum_dy = 0,                                                                  \
@@ -1502,6 +1552,8 @@ static int tps43_init(const struct device *dev) {
         .rdy_gpio = GPIO_DT_SPEC_INST_GET_OR(inst, rdy_gpios, {0}),                                  \
         .rst_gpio = GPIO_DT_SPEC_INST_GET_OR(inst, rst_gpios, {0}),                                  \
         .single_tap = DT_INST_PROP(inst, single_tap),                                                \
+        .tap_and_drag = DT_INST_PROP(inst, tap_and_drag),                                            \
+        .tap_and_drag_delay_ms = DT_INST_PROP_OR(inst, tap_and_drag_delay_ms, 250),                  \
         .press_and_hold = DT_INST_PROP(inst, press_and_hold),                                        \
         .two_finger_tap = DT_INST_PROP(inst, two_finger_tap),                                        \
         .three_finger_tap = DT_INST_PROP(inst, three_finger_tap),                                    \
