@@ -11,6 +11,7 @@ This driver should work with any IQS5XX-based trackpad (TPS43 or TPS65).
 - Trackpad movement.
 - Touch reporting: finger contact is reported as `INPUT_BTN_TOUCH` (1 when one or more fingers are on the pad, 0 when all fingers are lifted).
 - Single tap: registered as left click.
+- Double-tap drag: tap then tap-and-hold to drag (left click lock while moving until lift-off, with zero single-tap latency).
 - Two-finger tap: registered as right click.
 - Three-finger tap: registered as middle click (INPUT_BTN_2 / INPUT_BTN_MIDDLE).
 - Press and hold: registered as continuous left click (drag).
@@ -76,6 +77,8 @@ CONFIG_INPUT_TPS43=y
         // three-finger-tap-time-ms=<250>;      /* Max duration in ms for 3-finger tap, default 250 (optional) */
         // three-finger-tap-max-distance=<15>;  /* Max movement in px for 3-finger tap, default 15 (optional) */
         single-tap;
+        // tap-and-drag;                       /* Double-tap-to-drag (tap + tap-and-hold) (optional) */
+        // tap-and-drag-delay-ms=<250>;         /* Max interval in ms between taps for drag lock, default 250 (optional) */
         press-and-hold;
         swipes;
         // three-finger-swipe;                    /* 3-finger swipe only, without enabling 1-finger swipe (optional) */

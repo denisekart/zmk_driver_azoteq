@@ -109,6 +109,19 @@ properties:
     required: false
     description: Enable single tap gesture
 
+  tap-and-drag:
+    type: boolean
+    required: false
+    description: Enable double-tap-to-drag gesture (tap + tap-and-hold to drag)
+
+  tap-and-drag-delay-ms:
+    type: int
+    required: false
+    default: 250
+    description: >
+      Maximum interval in milliseconds between first tap lift and second tap contact
+      to engage the drag lock.
+
   two-finger-tap:
     type: boolean
     required: false
