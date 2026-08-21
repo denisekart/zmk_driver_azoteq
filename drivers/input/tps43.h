@@ -214,8 +214,6 @@ struct tps43_config {
     bool press_and_hold;
     bool two_finger_tap;
     bool three_finger_tap;
-    int16_t three_finger_tap_time_ms;
-    int16_t three_finger_tap_max_distance;
     bool scroll;
     bool zoom;
     bool swipes;
@@ -286,11 +284,7 @@ struct tps43_drv_data {
     bool suspended;
     bool touching;
     int64_t last_three_finger_swipe_ms;
-    int64_t three_finger_start_time_ms;
-    int32_t three_finger_accum_dx;
-    int32_t three_finger_accum_dy;
-    bool three_finger_tap_eligible;
-    bool three_finger_swipe_fired;
+    uint8_t touch_session_fingers;
     uint8_t prev_num_fingers;
 };
 

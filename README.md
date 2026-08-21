@@ -74,8 +74,6 @@ CONFIG_INPUT_TPS43=y
         scroll;
         two-finger-tap;
         // three-finger-tap;                    /* 3-finger tap (middle click INPUT_BTN_2) (optional) */
-        // three-finger-tap-time-ms=<250>;      /* Max duration in ms for 3-finger tap, default 250 (optional) */
-        // three-finger-tap-max-distance=<15>;  /* Max movement in px for 3-finger tap, default 15 (optional) */
         single-tap;
         // tap-and-drag;                       /* Double-tap-to-drag (tap + tap-and-hold) (optional) */
         // tap-and-drag-delay-ms=<250>;         /* Max interval in ms between taps for drag lock, default 250 (optional) */
