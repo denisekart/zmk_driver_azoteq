@@ -6,7 +6,6 @@
 #include <zephyr/sys/util.h>
 #include <zephyr/drivers/i2c.h>
 #include <zephyr/drivers/gpio.h>
-#include <zephyr/sys/byteorder.h>
 #include <zephyr/input/input.h>
 #include <zephyr/dt-bindings/input/input-event-codes.h>
 #include <zephyr/logging/log.h>
@@ -17,6 +16,8 @@
 #include "tps43.h"
 
 LOG_MODULE_REGISTER(tps43, CONFIG_INPUT_LOG_LEVEL);
+
+static int tps43_configure_device(const struct device *dev);
 
 /**
  * @brief Ends communication window with trackpad
@@ -29,13 +30,11 @@ LOG_MODULE_REGISTER(tps43, CONFIG_INPUT_LOG_LEVEL);
  */
 static void tps43_end_communication_window(const struct device *dev) {
     const struct tps43_config *config = dev->config;
-    uint8_t end_buf[2];
-
-    sys_put_be16(TPS43_REG_END_COMM_WINDOW, end_buf);
+    uint8_t end_buf[2] = {TPS43_REG_END_COMM_WINDOW >> 8, TPS43_REG_END_COMM_WINDOW & 0xFF};
 
     int ret = i2c_write_dt(&config->i2c_bus, end_buf, sizeof(end_buf));
     if (ret != 0 && ret != -EIO) {
-        LOG_INF("End communication window write returned: %d (NACK expected)", ret);
+        LOG_DBG("End communication window write returned: %d (NACK expected)", ret);
     }
 }
 
@@ -105,8 +104,7 @@ static int tps43_i2c_read_reg16(const struct device *dev, uint16_t reg, uint16_t
  * @param val Value to write (16-bit)
  * @return 0 on success, negative error code on failure
  */
-static __maybe_unused int tps43_i2c_write_reg16(const struct device *dev, uint16_t reg,
-                                                uint16_t val)
+static int tps43_i2c_write_reg16(const struct device *dev, uint16_t reg, uint16_t val)
 {
     const struct tps43_config *config = dev->config;
     // forms 4-byte register address: (MSB, LSB, MSB_VALUE, LSB_VALUE)
@@ -144,7 +142,7 @@ static int tps43_i2c_read_reg8_w_err(const struct device *dev, uint16_t reg, uin
     ret = i2c_write_read_dt(&config->i2c_bus, reg_buf, sizeof(reg_buf), val, 1);
     if (ret != 0) {
         if (!with_err) {
-            LOG_INF("Expected completion of register 0x%04x read: %d", reg, ret);
+            LOG_DBG("Expected completion of register 0x%04x read: %d", reg, ret);
         } else {
             LOG_ERR("Register 0x%04x read error: %d", reg, ret);
         }
@@ -201,15 +199,6 @@ static int tps43_i2c_write_reg8(const struct device *dev, uint16_t reg, uint8_t 
      k_work_submit(&drv_data->work);
  }
 
-
-/** Dump charging state */
-static void tps43_dump_status(const struct device *dev) {
-
-    uint8_t sys_info = 0;
-    tps43_i2c_read_reg8(dev, TPS43_REG_SYSTEM_INFO_0, &sys_info);
-    LOG_INF("Charging state: 0x%02X", sys_info & TPS43_CHARGING_MODE_MASK); // for debugging charging mode
-}
-
 /** Force communication start with the trackpad.  See datasheet 8.8.2 */
 static void tps43_force_communication(const struct device *dev) {
     // Do a bogus read where we don't care about a possible NACK
@@ -226,7 +215,7 @@ static void tps43_force_communication(const struct device *dev) {
  *
  * @param dev Pointer to trackpad device
  * @param suspend true - enter suspend, false - exit suspend
- * @param lock_held true if semaphore is already held (for internal use)
+ * @param lock_held true if mutex is already held (for internal use)
  * @return 0 on success, negative error code on failure
  */
 static int tps43_set_suspend_internal(const struct device *dev, bool suspend, bool lock_held) {
@@ -234,15 +223,15 @@ static int tps43_set_suspend_internal(const struct device *dev, bool suspend, bo
     const struct tps43_config *config = dev->config;
     int ret = 0;
 
-    // If power management is disabled, or device is already in the desired state, do nothing
-    if (drv_data->suspended == suspend || !config->enable_power_management) {
+    // If power management is disabled, device not initialized, or device is already in the desired state, do nothing
+    if (!drv_data->initialized || drv_data->suspended == suspend || !config->enable_power_management) {
         return 0;
     }
 
-    // Acquire semaphore if not already held
+    // Acquire mutex if not already held
     if (!lock_held) {
-        if (k_sem_take(&drv_data->lock, K_MSEC(100)) != 0) {
-            LOG_WRN("Failed to acquire semaphore for suspend/resume");
+        if (k_mutex_lock(&drv_data->lock, K_MSEC(100)) != 0) {
+            LOG_WRN("Failed to acquire mutex for suspend/resume");
             return -EBUSY;
         }
     }
@@ -286,9 +275,6 @@ static int tps43_set_suspend_internal(const struct device *dev, bool suspend, bo
         ret = tps43_i2c_read_reg8(dev, TPS43_REG_SYSTEM_CONTROL_1, &control_reg);
 
     } else if (!drv_data->suspended) {
-        tps43_force_communication(dev);
-        tps43_dump_status(dev); // for debugging power management behavior
-
         // Read current value
         ret = tps43_i2c_read_reg8(dev, TPS43_REG_SYSTEM_CONTROL_1, &control_reg);
     }
@@ -318,14 +304,22 @@ static int tps43_set_suspend_internal(const struct device *dev, bool suspend, bo
 done:
     // Enable RDY interrupts after resume
     if (!suspend && config->rdy_gpio.port != NULL) {
-        ret = gpio_pin_interrupt_configure_dt(&config->rdy_gpio, GPIO_INT_EDGE_TO_ACTIVE);
-        if (ret == 0) {
+        int gpio_ret = gpio_pin_interrupt_configure_dt(&config->rdy_gpio, GPIO_INT_EDGE_TO_ACTIVE);
+        if (gpio_ret == 0) {
             LOG_INF("RDY interrupts enabled");
+            if (gpio_pin_get_dt(&config->rdy_gpio) > 0) {
+                k_work_submit(&drv_data->work);
+            }
+        } else {
+            LOG_ERR("Failed to enable RDY interrupt: %d", gpio_ret);
+            if (ret == 0) {
+                ret = gpio_ret;
+            }
         }
     }
     tps43_end_communication_window(dev);
     if (!lock_held) {
-        k_sem_give(&drv_data->lock);
+        k_mutex_unlock(&drv_data->lock);
     }
     return ret;
 }
@@ -365,22 +359,22 @@ static void tps43_handle_swipe(const struct device *dev, uint8_t num_fingers, in
     }
 
     if (rel_x < 0) {
-        LOG_INF("%d-finger swipe left - INPUT_BTN_WEST", num_fingers);
+        LOG_DBG("%d-finger swipe left - INPUT_BTN_WEST", num_fingers);
         input_report_key(dev, INPUT_BTN_WEST, 1, true, K_FOREVER);
         input_report_key(dev, INPUT_BTN_WEST, 0, true, K_FOREVER);
     }
     if (rel_x > 0) {
-        LOG_INF("%d-finger swipe right - INPUT_BTN_EAST", num_fingers);
+        LOG_DBG("%d-finger swipe right - INPUT_BTN_EAST", num_fingers);
         input_report_key(dev, INPUT_BTN_EAST, 1, true, K_FOREVER);
         input_report_key(dev, INPUT_BTN_EAST, 0, true, K_FOREVER);
     }
     if (rel_y < 0) {
-        LOG_INF("%d-finger swipe up - INPUT_BTN_NORTH", num_fingers);
+        LOG_DBG("%d-finger swipe up - INPUT_BTN_NORTH", num_fingers);
         input_report_key(dev, INPUT_BTN_NORTH, 1, true, K_FOREVER);
         input_report_key(dev, INPUT_BTN_NORTH, 0, true, K_FOREVER);
     }
     if (rel_y > 0) {
-        LOG_INF("%d-finger swipe down - INPUT_BTN_SOUTH", num_fingers);
+        LOG_DBG("%d-finger swipe down - INPUT_BTN_SOUTH", num_fingers);
         input_report_key(dev, INPUT_BTN_SOUTH, 1, true, K_FOREVER);
         input_report_key(dev, INPUT_BTN_SOUTH, 0, true, K_FOREVER);
     }
@@ -391,8 +385,14 @@ static void tps43_handle_swipe(const struct device *dev, uint8_t num_fingers, in
  */
 static inline bool tps43_is_near_edge(const struct tps43_config *config, uint16_t x, uint16_t y) {
     int16_t max_x = (config->x_resolution > 0) ? config->x_resolution : 2048;
-    int16_t max_y = (config->y_resolution > 0) ? config->y_resolution : 1536;
+    int16_t max_y = (config->y_resolution > 0) ? config->y_resolution : 1792;
     int16_t buf = config->drag_continuation_edge_buffer;
+
+    if (config->switch_xy) {
+        int16_t tmp = max_x;
+        max_x = max_y;
+        max_y = tmp;
+    }
 
     return (x <= buf) || (x >= (max_x - buf)) ||
            (y <= buf) || (y >= (max_y - buf));
@@ -406,26 +406,23 @@ static void tps43_drag_continuation_timeout(struct k_work *work) {
     struct tps43_drv_data *drv_data = CONTAINER_OF(dwork, struct tps43_drv_data, drag_continuation_work);
     const struct device *dev = drv_data->dev;
 
-    if (k_sem_take(&drv_data->lock, K_MSEC(20)) != 0) {
+    if (k_mutex_lock(&drv_data->lock, K_MSEC(20)) != 0) {
         LOG_WRN("Drag continuation timeout could not take lock, rescheduling 10ms");
         k_work_reschedule(&drv_data->drag_continuation_work, K_MSEC(10));
         return;
     }
 
     if (drv_data->drag_continuation_active) {
-        LOG_INF("Drag continuation timeout expired -> Releasing INPUT_BTN_0");
+        LOG_DBG("Drag continuation timeout expired -> Releasing INPUT_BTN_0");
         drv_data->drag_continuation_active = false;
         drv_data->tap_drag_active = false;
         drv_data->drag_active = false;
         drv_data->tap_drag_state = TPS43_TAP_DRAG_IDLE;
-
-        if (drv_data->drag_button_pressed) {
-            drv_data->drag_button_pressed = false;
-            input_report_key(dev, INPUT_BTN_0, 0, true, K_FOREVER);
-        }
+        drv_data->drag_button_pressed = false;
+        input_report_key(dev, INPUT_BTN_0, 0, true, K_FOREVER);
     }
 
-    k_sem_give(&drv_data->lock);
+    k_mutex_unlock(&drv_data->lock);
 }
 
 /**
@@ -436,7 +433,7 @@ static void tps43_drag_continuation_timeout(struct k_work *work) {
  * converting them into input events for the ZMK system.
  * Also manages trackpad wake-up from suspend mode when activity is detected.
  *
- * Protected by semaphore to prevent interruption by other I2C operations,
+ * Protected by mutex to prevent interruption by other I2C operations,
  * which ensures smooth cursor movement without interruptions.
  *
  * @param work Pointer to work structure
@@ -451,15 +448,15 @@ static void tps43_work_handler(struct k_work *work) {
     bool was_tap_drag_active = drv_data->tap_drag_active;
     int ret;
 
-    // If device is in suspend, ignore interrupt (RDY should be disabled)
-    if (drv_data->suspended) {
-        LOG_WRN("RDY interrupt in suspend mode - ignoring");
+    // If device is not initialized or in suspend, ignore interrupt (RDY should be disabled)
+    if (!drv_data->initialized || drv_data->suspended) {
+        LOG_WRN("RDY interrupt while uninitialized or in suspend mode - ignoring");
         return;
     }
 
-    // Acquire semaphore to protect all I2C operations from interruption
+    // Acquire mutex to protect all I2C and state operations from interruption
     // This prevents conflicts during simultaneous trackpad access
-    k_sem_take(&drv_data->lock, K_FOREVER);
+    k_mutex_lock(&drv_data->lock, K_FOREVER);
 
     /*
      * Read registers in a single I2C transaction instead of issuing several independent reads.
@@ -482,8 +479,32 @@ static void tps43_work_handler(struct k_work *work) {
 
     uint8_t touch_data[13];
     ret = read_sequence_registers(dev, TPS43_REG_GESTURE_EVENTS_0, touch_data, read_len);
+    /* Immediately free the trackpad so it begins the next capacitive sample cycle */
+    tps43_end_communication_window(dev);
+
     if (ret < 0) {
         LOG_ERR("Touch data read error: %d", ret);
+        goto done;
+    }
+
+    /* Runtime reset detection and recovery */
+    if (unlikely(touch_data[2] & TPS43_SHOW_RESET)) {
+        LOG_WRN("Runtime reset detected on trackpad, reconfiguring...");
+        tps43_i2c_write_reg8(dev, TPS43_REG_SYSTEM_CONTROL_0, TPS43_ACK_RESET | TPS43_AUTO_ATI);
+        tps43_configure_device(dev);
+        tps43_end_communication_window(dev);
+
+        if (drv_data->touching) {
+            drv_data->touching = false;
+            input_report_key(dev, INPUT_BTN_TOUCH, 0, true, K_FOREVER);
+        }
+        if (drv_data->drag_button_pressed || is_drag_active || drv_data->tap_drag_active) {
+            drv_data->drag_button_pressed = false;
+            drv_data->tap_drag_active = false;
+            is_drag_active = false;
+            drv_data->tap_drag_state = TPS43_TAP_DRAG_IDLE;
+            input_report_key(dev, INPUT_BTN_0, 0, true, K_FOREVER);
+        }
         goto done;
     }
 
@@ -502,10 +523,10 @@ static void tps43_work_handler(struct k_work *work) {
         k_work_cancel_delayable(&drv_data->drag_continuation_work);
 
         if (num_fingers == 1) {
-            LOG_INF("Drag continuation resumed from reposition");
+            LOG_DBG("Drag continuation resumed from reposition");
             drv_data->drag_continuation_active = false;
         } else {
-            LOG_INF("Continuation aborted by finger count (%d) -> Releasing button", num_fingers);
+            LOG_DBG("Continuation aborted by finger count (%d) -> Releasing button", num_fingers);
             drv_data->drag_continuation_active = false;
             drv_data->tap_drag_active = false;
             drv_data->drag_active = false;
@@ -525,7 +546,7 @@ static void tps43_work_handler(struct k_work *work) {
     bool is_touching = (num_fingers > 0);
     if (is_touching != drv_data->touching) {
         drv_data->touching = is_touching;
-        LOG_INF("Touch state changed: %s", is_touching ? "down" : "up");
+        LOG_DBG("Touch state changed: %s", is_touching ? "down" : "up");
         input_report_key(dev, INPUT_BTN_TOUCH, is_touching ? 1 : 0, true, K_FOREVER);
     }
 
@@ -539,7 +560,7 @@ static void tps43_work_handler(struct k_work *work) {
         if (drv_data->tap_drag_state == TPS43_TAP_DRAG_FIRST_TAP) {
             int64_t now = k_uptime_get();
             if ((now - drv_data->tap_drag_up_time_ms) <= config->tap_and_drag_delay_ms) {
-                LOG_INF("Second tap contact within %d ms -> ENGAGE TAP-DRAG LOCK",
+                LOG_DBG("Second tap contact within %d ms -> ENGAGE TAP-DRAG LOCK",
                         config->tap_and_drag_delay_ms);
                 drv_data->tap_drag_state = TPS43_TAP_DRAG_ACTIVE;
                 drv_data->tap_drag_active = true;
@@ -553,7 +574,7 @@ static void tps43_work_handler(struct k_work *work) {
     /* Multi-finger touch cancels any pending tap-drag or active tap-drag lock */
     if (num_fingers > 1 && (drv_data->tap_drag_state != TPS43_TAP_DRAG_IDLE || drv_data->tap_drag_active)) {
         if (drv_data->tap_drag_active) {
-            LOG_INF("Multi-finger touch -> RELEASE TAP-DRAG LEFT BUTTON");
+            LOG_DBG("Multi-finger touch -> RELEASE TAP-DRAG LEFT BUTTON");
             input_report_key(dev, INPUT_BTN_0, 0, true, K_FOREVER);
             drv_data->tap_drag_active = false;
         }
@@ -562,11 +583,11 @@ static void tps43_work_handler(struct k_work *work) {
 
     if (gestures_events[0] != 0 || gestures_events[1] != 0) {
 
-        LOG_INF("Gestures: Single=0x%02X, Multi=0x%02X", gestures_events[0], gestures_events[1]);
+        LOG_DBG("Gestures: Single=0x%02X, Multi=0x%02X", gestures_events[0], gestures_events[1]);
 
         if (gestures_events[0] & TPS43_SINGLE_TAP) {
             if (!was_tap_drag_active) {
-                LOG_INF("Single tap → LEFT BUTTON");
+                LOG_DBG("Single tap → LEFT BUTTON");
                 input_report_key(dev, INPUT_BTN_0, 1, true, K_FOREVER);
                 input_report_key(dev, INPUT_BTN_0, 0, true, K_FOREVER);
 
@@ -577,22 +598,22 @@ static void tps43_work_handler(struct k_work *work) {
             }
         }
         if (gestures_events[0] & (TPS43_SWIPE_UP | TPS43_SWIPE_DOWN | TPS43_SWIPE_LEFT | TPS43_SWIPE_RIGHT)) {
-            LOG_INF("Single finger swipe");
+            LOG_DBG("Single finger swipe");
             tps43_handle_swipe(dev, num_fingers, rel_x, rel_y);
         }
         if (gestures_events[1] & TPS43_TWO_FINGER_TAP) {
             if (config->three_finger_tap && drv_data->touch_session_fingers >= 3) {
-                LOG_INF("Three finger tap -> MIDDLE BUTTON (INPUT_BTN_2)");
+                LOG_DBG("Three finger tap -> MIDDLE BUTTON (INPUT_BTN_2)");
                 input_report_key(dev, INPUT_BTN_2, 1, true, K_FOREVER);
                 input_report_key(dev, INPUT_BTN_2, 0, true, K_FOREVER);
             } else if (config->two_finger_tap) {
-                LOG_INF("Two finger tap -> RIGHT BUTTON (INPUT_BTN_1)");
+                LOG_DBG("Two finger tap -> RIGHT BUTTON (INPUT_BTN_1)");
                 input_report_key(dev, INPUT_BTN_1, 1, true, K_FOREVER);
                 input_report_key(dev, INPUT_BTN_1, 0, true, K_FOREVER);
             }
         }
         if ((gestures_events[0] & TPS43_PRESS_AND_HOLD) && !is_drag_active && !drv_data->tap_drag_active) {
-            LOG_INF("Press and hold detected - DRAG (HOLD LEFT BUTTON)");
+            LOG_DBG("Press and hold detected - DRAG (HOLD LEFT BUTTON)");
             // set internal drag flag and press left mouse button
             is_drag_active = true;
             input_report_key(dev, INPUT_BTN_0, 1, true, K_FOREVER);
@@ -610,7 +631,7 @@ static void tps43_work_handler(struct k_work *work) {
     // Detect release of a 'press and hold' left press
     if ((!(gestures_events[0] & TPS43_PRESS_AND_HOLD)) && is_drag_active) {
         if (num_fingers > 0) {
-            LOG_INF("Press and hold end detected while touching - RELEASE LEFT BUTTON");
+            LOG_DBG("Press and hold end detected while touching - RELEASE LEFT BUTTON");
             is_drag_active = false;
             input_report_key(dev, INPUT_BTN_0, 0, true, K_FOREVER);
         }
@@ -623,7 +644,7 @@ static void tps43_work_handler(struct k_work *work) {
         if (config->drag_continuation && drag_is_active &&
             tps43_is_near_edge(config, drv_data->last_abs_x, drv_data->last_abs_y)) {
 
-            LOG_INF("Edge lift detected -> Arming drag continuation (%d ms)",
+            LOG_DBG("Edge lift detected -> Arming drag continuation (%d ms)",
                     config->drag_continuation_timeout_ms);
             drv_data->drag_continuation_active = true;
             k_work_reschedule(&drv_data->drag_continuation_work,
@@ -631,16 +652,12 @@ static void tps43_work_handler(struct k_work *work) {
             /* Keep is_drag_active / tap_drag_active intact and do not emit button release */
         } else {
             if (drv_data->tap_drag_active || is_drag_active) {
-                LOG_INF("Drag contact lost -> RELEASE LEFT BUTTON");
+                LOG_DBG("Drag contact lost -> RELEASE LEFT BUTTON");
                 drv_data->tap_drag_active = false;
                 is_drag_active = false;
                 drv_data->tap_drag_state = TPS43_TAP_DRAG_IDLE;
-                if (drv_data->drag_button_pressed) {
-                    drv_data->drag_button_pressed = false;
-                    input_report_key(dev, INPUT_BTN_0, 0, true, K_FOREVER);
-                } else {
-                    input_report_key(dev, INPUT_BTN_0, 0, true, K_FOREVER);
-                }
+                drv_data->drag_button_pressed = false;
+                input_report_key(dev, INPUT_BTN_0, 0, true, K_FOREVER);
             }
         }
     }
@@ -654,7 +671,7 @@ static void tps43_work_handler(struct k_work *work) {
 
     if (rel_x != 0 || rel_y != 0) {
         if (num_fingers == 3) {
-            LOG_INF("Three-finger movement - checking for swipe");
+            LOG_DBG("Three-finger movement - checking for swipe");
             tps43_handle_swipe(dev, num_fingers, rel_x, rel_y);
         } else if (is_scroll_active) {
             // Scroll processing: keep only dominant axis
@@ -664,27 +681,33 @@ static void tps43_work_handler(struct k_work *work) {
                     rel_x = -rel_x;
                 }
                 int16_t wheel = (rel_x * config->scroll_sensitivity) / 100;
-                LOG_INF("Scrolling %d horizontally", wheel);
-                input_report_rel(dev, INPUT_REL_HWHEEL, wheel, true, K_FOREVER);
+                if (wheel != 0) {
+                    LOG_DBG("Scrolling %d horizontally", wheel);
+                    input_report_rel(dev, INPUT_REL_HWHEEL, wheel, true, K_FOREVER);
+                }
             } else {
                 // Vertical scroll
                 if (config->invert_scroll_y) {
                     rel_y = -rel_y;
                 }
                 int16_t wheel = (rel_y * config->scroll_sensitivity) / 100;
-                LOG_INF("Scrolling %d vertically", wheel);
-                input_report_rel(dev, INPUT_REL_WHEEL, wheel, true, K_FOREVER);
+                if (wheel != 0) {
+                    LOG_DBG("Scrolling %d vertically", wheel);
+                    input_report_rel(dev, INPUT_REL_WHEEL, wheel, true, K_FOREVER);
+                }
             }
             is_scroll_active = false;
         } else if (is_zoom_active) {
             // Zoom processing: the zoom amount comes in via rel_x
             int16_t zoom_delta = (rel_x * config->zoom_sensitivity) / 100;
-            LOG_INF("Zooming %d, rel_x=%d", zoom_delta, rel_x);
-            input_report_rel(dev, INPUT_REL_MISC, zoom_delta, true, K_FOREVER);
+            if (zoom_delta != 0) {
+                LOG_DBG("Zooming %d, rel_x=%d", zoom_delta, rel_x);
+                input_report_rel(dev, INPUT_REL_MISC, zoom_delta, true, K_FOREVER);
+            }
             is_zoom_active = false;
         } else {
             // Normal cursor movement
-            if (rel_x != 0 ) {
+            if (rel_x != 0) {
                 int32_t scaled_x = ((int32_t)rel_x * config->sensitivity) / 100;
                 rel_x = (int16_t)CLAMP(scaled_x, INT16_MIN, INT16_MAX);
             }
@@ -692,10 +715,14 @@ static void tps43_work_handler(struct k_work *work) {
                 int32_t scaled_y = ((int32_t)rel_y * config->sensitivity) / 100;
                 rel_y = (int16_t)CLAMP(scaled_y, INT16_MIN, INT16_MAX);
             }
-            LOG_INF("Sending movement: dx=%d, dy=%d", rel_x, rel_y);
+            LOG_DBG("Sending movement: dx=%d, dy=%d", rel_x, rel_y);
 
-            input_report_rel(dev, INPUT_REL_X, rel_x, false, K_FOREVER);
-            input_report_rel(dev, INPUT_REL_Y, rel_y, true, K_FOREVER);
+            if (rel_x != 0) {
+                input_report_rel(dev, INPUT_REL_X, rel_x, (rel_y == 0), K_FOREVER);
+            }
+            if (rel_y != 0) {
+                input_report_rel(dev, INPUT_REL_Y, rel_y, true, K_FOREVER);
+            }
         }
     }
 
@@ -708,10 +735,9 @@ static void tps43_work_handler(struct k_work *work) {
 done:
     // Save for next call
     drv_data->drag_active = is_drag_active;
-    tps43_end_communication_window(dev);
 
-    // Release semaphore after completing all I2C operations
-    k_sem_give(&drv_data->lock);
+    // Release mutex after completing event handling
+    k_mutex_unlock(&drv_data->lock);
 }
 
 /**
@@ -1595,6 +1621,15 @@ static int tps43_init(const struct device *dev) {
         return ret;
     }
 
+    // Initialize mutex to protect I2C operations
+    k_mutex_init(&drv_data->lock);
+
+    k_work_init(&drv_data->work, tps43_work_handler);
+    k_work_init_delayable(&drv_data->drag_continuation_work, tps43_drag_continuation_timeout);
+
+    drv_data->initialized = true;
+    drv_data->suspended = false;
+
     // configure RDY interrupts only AFTER device configuration!
     if (config->rdy_gpio.port != NULL) {
         ret = gpio_pin_configure_dt(&config->rdy_gpio, GPIO_INPUT);
@@ -1609,23 +1644,15 @@ static int tps43_init(const struct device *dev) {
                 ret = gpio_add_callback(config->rdy_gpio.port, &drv_data->rdy_cb);
                 if (ret == 0) {
                     LOG_INF("RDY interrupt configured");
+                    if (gpio_pin_get_dt(&config->rdy_gpio) > 0) {
+                        k_work_submit(&drv_data->work);
+                    }
                 } else {
                     LOG_WRN("RDY callback add error: %d", ret);
                 }
             }
         }
     }
-
-    drv_data->initialized = true;
-    drv_data->suspended = false;
-
-    // Initialize semaphore to protect I2C operations
-    // First parameter - initial count (1 = available)
-    // Second parameter - maximum count (1 = binary semaphore)
-    k_sem_init(&drv_data->lock, 1, 1);
-
-    k_work_init(&drv_data->work, tps43_work_handler);
-    k_work_init_delayable(&drv_data->drag_continuation_work, tps43_drag_continuation_timeout);
 
     tps43_dump_registers(dev);
 
@@ -1717,8 +1744,7 @@ static int tps43_init(const struct device *dev) {
     };                                                                                               \
                                                                                                      \
     DEVICE_DT_INST_DEFINE(inst, tps43_init, NULL, &tps43_##inst##_drvdata, &tps43_##inst##_config,   \
-                        POST_KERNEL, CONFIG_INPUT_INIT_PRIORITY, NULL);                              \
-    BUILD_ASSERT(DT_INST_REG_ADDR(inst) == TPS43_I2C_ADDR, "I2C address mismatch");
+                        POST_KERNEL, CONFIG_INPUT_INIT_PRIORITY, NULL);
 
 
 DT_INST_FOREACH_STATUS_OKAY(TPS43_INIT)

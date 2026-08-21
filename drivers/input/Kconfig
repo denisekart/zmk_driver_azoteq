@@ -16,4 +16,4 @@ config INPUT_TPS43_INIT_PRIORITY
     help
       Device driver initialization priority.
 
-endif # ZMK_SENSOR_TPS43
+endif # INPUT_TPS43

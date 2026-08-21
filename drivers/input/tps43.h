@@ -1,6 +1,7 @@
 #pragma once
 
 #include <zephyr/device.h>
+#include <zephyr/kernel.h>
 #include <zephyr/sys/util.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/i2c.h>
@@ -107,7 +108,6 @@ extern "C" {
 /* ============================================================ */
 
 #define TPS43_SHOW_RESET            BIT(7)      /* Flag check on system reset */
-#define TPS43_CHARGING_MODE_MASK    0x07        /* Charging mode (bits 0-3) */
 
 /* ============================================================ */
 /* System information 1 (0x0010) - Status flags - 8 bits */
@@ -274,7 +274,7 @@ struct tps43_config {
 
 struct tps43_drv_data {
     const struct device *dev;
-    struct k_sem lock;
+    struct k_mutex lock;
     struct gpio_callback rdy_cb;
     struct k_work work;
     struct k_work_delayable drag_continuation_work;

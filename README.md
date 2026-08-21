@@ -180,7 +180,7 @@ SCL on nice!nano -> SCL on IQS5xx.
    └─> RST: LOW (10ms) → HIGH
    └─> Wait ~600ms for firmware loading
 
-2. Check SHOW_RESET flag (0x000F bit 0)
+2. Check SHOW_RESET flag (0x000F bit 7)
    └─> Poll until flag appears
 
 3. Acknowledge reset
@@ -238,7 +238,7 @@ trackpad to sleep:
 
 **Control register:**
 - Suspend mode is controlled via the `SYSTEM_CONTROL_1` register (0x0432)
-- The `TPS43_SUSPEND` bit (BIT(1)) is set to enter suspend mode
+- The `TPS43_SUSPEND` bit (BIT(0)) is set to enter suspend mode
 - In suspend mode, the trackpad consumes minimal power and does not process touches
 
 **Wake-up:**
@@ -246,4 +246,14 @@ trackpad to sleep:
 - On wake-up, the trackpad automatically processes the first touch
 
 > Without `enable-power-management`, power management is completely disabled
+
+## Performance & Stability Optimizations
+
+- **Mutex Synchronization**: Uses `k_mutex` with priority inheritance to prevent priority inversion with high-priority BLE and system threads.
+- **Reduced Latency**: Closes communication window (`0xEEEE`) immediately after reading I2C frame data, enabling concurrent hardware scanning and host processing.
+- **Runtime Reset Recovery**: Fast `SHOW_RESET` detection in the work loop automatically recovers configuration after ESD or watchdog events.
+- **Interrupt Reliability**: Drains pending active RDY line state on boot and resume to prevent missed rising-edge transitions.
+- **Hot-Path Log Demotion**: Demoted per-frame coordinate and gesture logs to `LOG_DBG` to eliminate serial/RTT bottlenecks.
+- **Zero-Delta Suppression**: Skips dispatching redundant relative input events when coordinate displacement is zero.
+- **Streamlined Suspend & Addressing**: Cleaned up suspend entry I2C transactions and relaxed hardcoded I2C address checks.
 
