@@ -62,16 +62,18 @@ properties:
   x-resolution:
     type: int
     required: false
+    default: 2048
     description: |
       X axis resolution in pixels
-      Sets the trackpad X resolution. Only written if explicitly set.
+      Sets the trackpad X resolution. Default is 2048.
 
   y-resolution:
     type: int
     required: false
+    default: 1792
     description: |
       Y axis resolution in pixels
-      Sets the trackpad Y resolution. Only written if explicitly set.
+      Sets the trackpad Y resolution. Default is 1792.
 
   sensitivity:
     type: int
@@ -117,13 +119,13 @@ properties:
   drag-continuation-timeout-ms:
     type: int
     required: false
-    default: 800
+    default: 600
     description: Maximum lift time in milliseconds allowed to reposition finger during edge drag.
 
   drag-continuation-edge-buffer:
     type: int
     required: false
-    default: 128
+    default: 140
     description: Border width in coordinate pixels defining the edge continuation trigger zone.
 
   two-finger-tap:

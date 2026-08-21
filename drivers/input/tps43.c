@@ -586,15 +586,6 @@ static void tps43_work_handler(struct k_work *work) {
         }
     }
 
-    // Detect release of a 'press and hold' left press
-    if ((!(gestures_events[0] & TPS43_PRESS_AND_HOLD)) && is_drag_active) {
-        if (num_fingers > 0) {
-            LOG_DBG("Press and hold end detected while touching - RELEASE LEFT BUTTON");
-            is_drag_active = false;
-            input_report_key(dev, INPUT_BTN_0, 0, true, K_FOREVER);
-        }
-    }
-
     /* Release drag lock when contact is lost */
     if (drv_data->prev_num_fingers > 0 && num_fingers == 0) {
         if (config->drag_continuation && is_drag_active &&
@@ -849,8 +840,8 @@ static int tps43_configure_device(const struct device *dev) {
         LOG_INF("Dynamic filter upper set: 0x%04X", (uint16_t)config->filter_dynamic_upper);
     }
 
-    // resolution configuration (only if set in DT)
-    if (config->x_resolution != -1) {
+    // resolution configuration
+    if (config->x_resolution > 0) {
         ret = tps43_i2c_write_reg16(dev, TPS43_REG_X_RESOLUTION,
                                     (uint16_t)config->x_resolution);
         if (ret != 0) {
@@ -860,7 +851,7 @@ static int tps43_configure_device(const struct device *dev) {
         LOG_INF("X resolution set: %d", (uint16_t)config->x_resolution);
     }
 
-    if (config->y_resolution != -1) {
+    if (config->y_resolution > 0) {
         ret = tps43_i2c_write_reg16(dev, TPS43_REG_Y_RESOLUTION,
                                     (uint16_t)config->y_resolution);
         if (ret != 0) {
@@ -1633,8 +1624,8 @@ static int tps43_init(const struct device *dev) {
         .rst_gpio = GPIO_DT_SPEC_INST_GET_OR(inst, rst_gpios, {0}),                                  \
         .single_tap = DT_INST_PROP(inst, single_tap),                                                \
         .drag_continuation = DT_INST_PROP_OR(inst, drag_continuation, false),                         \
-        .drag_continuation_timeout_ms = DT_INST_PROP_OR(inst, drag_continuation_timeout_ms, 250),    \
-        .drag_continuation_edge_buffer = DT_INST_PROP_OR(inst, drag_continuation_edge_buffer, 128),  \
+        .drag_continuation_timeout_ms = DT_INST_PROP_OR(inst, drag_continuation_timeout_ms, 600),    \
+        .drag_continuation_edge_buffer = DT_INST_PROP_OR(inst, drag_continuation_edge_buffer, 140),  \
         .press_and_hold = DT_INST_PROP(inst, press_and_hold),                                        \
         .two_finger_tap = DT_INST_PROP(inst, two_finger_tap),                                        \
         .three_finger_tap = DT_INST_PROP(inst, three_finger_tap),                                    \
@@ -1657,8 +1648,8 @@ static int tps43_init(const struct device *dev) {
         .filter_dynamic_bottom = DT_INST_PROP_OR(inst, filter_dynamic_bottom, -1),                    \
         .filter_dynamic_lower = DT_INST_PROP_OR(inst, filter_dynamic_lower, -1),                     \
         .filter_dynamic_upper = DT_INST_PROP_OR(inst, filter_dynamic_upper, -1),                     \
-        .x_resolution = DT_INST_PROP_OR(inst, x_resolution, -1),                                     \
-        .y_resolution = DT_INST_PROP_OR(inst, y_resolution, -1),                                     \
+        .x_resolution = DT_INST_PROP_OR(inst, x_resolution, 2048),                                   \
+        .y_resolution = DT_INST_PROP_OR(inst, y_resolution, 1792),                                   \
         .swipe_initial_distance = DT_INST_PROP_OR(inst, swipe_initial_distance, -1),                 \
         .swipe_initial_time = DT_INST_PROP_OR(inst, swipe_initial_time, -1),                         \
         .swipe_angle = DT_INST_PROP_OR(inst, swipe_angle, -1),                                       \
