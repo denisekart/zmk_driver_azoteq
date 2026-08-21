@@ -125,7 +125,6 @@ properties:
   drag-continuation:
     type: boolean
     required: false
-    default: false
     description: Enable edge drag continuation with lift-and-reposition support.
 
   drag-continuation-timeout-ms:
