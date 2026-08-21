@@ -122,6 +122,24 @@ properties:
       Maximum interval in milliseconds between first tap lift and second tap contact
       to engage the drag lock.
 
+  drag-continuation:
+    type: boolean
+    required: false
+    default: false
+    description: Enable edge drag continuation with lift-and-reposition support.
+
+  drag-continuation-timeout-ms:
+    type: int
+    required: false
+    default: 350
+    description: Maximum lift time in milliseconds allowed to reposition finger during edge drag.
+
+  drag-continuation-edge-buffer:
+    type: int
+    required: false
+    default: 96
+    description: Border width in coordinate pixels defining the edge continuation trigger zone.
+
   two-finger-tap:
     type: boolean
     required: false

@@ -253,11 +253,16 @@ static int tps43_set_suspend_internal(const struct device *dev, bool suspend, bo
         input_report_key(dev, INPUT_BTN_TOUCH, 0, true, K_FOREVER);
     }
 
-    if (suspend && (drv_data->drag_active || drv_data->tap_drag_active)) {
+    if (suspend && (drv_data->drag_active || drv_data->tap_drag_active || drv_data->drag_continuation_active || drv_data->drag_button_pressed)) {
+        k_work_cancel_delayable(&drv_data->drag_continuation_work);
+        drv_data->drag_continuation_active = false;
         drv_data->drag_active = false;
         drv_data->tap_drag_active = false;
         drv_data->tap_drag_state = TPS43_TAP_DRAG_IDLE;
-        input_report_key(dev, INPUT_BTN_0, 0, true, K_FOREVER);
+        if (drv_data->drag_button_pressed) {
+            drv_data->drag_button_pressed = false;
+            input_report_key(dev, INPUT_BTN_0, 0, true, K_FOREVER);
+        }
     }
 
     // Disable RDY interrupts when entering suspend (before any I2C operations)
@@ -382,6 +387,48 @@ static void tps43_handle_swipe(const struct device *dev, uint8_t num_fingers, in
 }
 
 /**
+ * @brief Checks if the given absolute coordinates are near the trackpad edge
+ */
+static inline bool tps43_is_near_edge(const struct tps43_config *config, uint16_t x, uint16_t y) {
+    int16_t max_x = (config->x_resolution > 0) ? config->x_resolution : 2048;
+    int16_t max_y = (config->y_resolution > 0) ? config->y_resolution : 1536;
+    int16_t buf = config->drag_continuation_edge_buffer;
+
+    return (x <= buf) || (x >= (max_x - buf)) ||
+           (y <= buf) || (y >= (max_y - buf));
+}
+
+/**
+ * @brief Delayable work handler for drag continuation timeout expiration
+ */
+static void tps43_drag_continuation_timeout(struct k_work *work) {
+    struct k_work_delayable *dwork = k_work_delayable_from_work(work);
+    struct tps43_drv_data *drv_data = CONTAINER_OF(dwork, struct tps43_drv_data, drag_continuation_work);
+    const struct device *dev = drv_data->dev;
+
+    if (k_sem_take(&drv_data->lock, K_MSEC(20)) != 0) {
+        LOG_WRN("Drag continuation timeout could not take lock, rescheduling 10ms");
+        k_work_reschedule(&drv_data->drag_continuation_work, K_MSEC(10));
+        return;
+    }
+
+    if (drv_data->drag_continuation_active) {
+        LOG_INF("Drag continuation timeout expired -> Releasing INPUT_BTN_0");
+        drv_data->drag_continuation_active = false;
+        drv_data->tap_drag_active = false;
+        drv_data->drag_active = false;
+        drv_data->tap_drag_state = TPS43_TAP_DRAG_IDLE;
+
+        if (drv_data->drag_button_pressed) {
+            drv_data->drag_button_pressed = false;
+            input_report_key(dev, INPUT_BTN_0, 0, true, K_FOREVER);
+        }
+    }
+
+    k_sem_give(&drv_data->lock);
+}
+
+/**
  * @brief Main work handler for processing trackpad events
  *
  * Executed when receiving an interrupt from the trackpad (RDY pin).
@@ -415,9 +462,10 @@ static void tps43_work_handler(struct k_work *work) {
     k_sem_take(&drv_data->lock, K_FOREVER);
 
     /*
-     * Read the whole contiguous block from GESTURE_EVENTS_0 through REL_Y in a
-     * single I2C transaction instead of issuing several independent reads.
-     * This is much cheaper on the bus. Byte offsets into the buffer:
+     * Read registers in a single I2C transaction instead of issuing several independent reads.
+     * When drag continuation is enabled, read up through ABS_Y (13 bytes) to obtain absolute
+     * touch coordinates for edge detection. When disabled, read 9 bytes up through REL_Y.
+     * Byte offsets into the buffer:
      *   [0] GESTURE_EVENTS_0   (0x000D)
      *   [1] GESTURE_EVENTS_1   (0x000E)
      *   [2] SYSTEM_INFO_0      (0x000F)
@@ -425,10 +473,15 @@ static void tps43_work_handler(struct k_work *work) {
      *   [4] NUM_FINGERS        (0x0011)
      *   [5..6] REL_X           (0x0012, big-endian)
      *   [7..8] REL_Y           (0x0014, big-endian)
+     *   [9..10] ABS_X          (0x0016, big-endian, when drag continuation is enabled)
+     *   [11..12] ABS_Y         (0x0018, big-endian, when drag continuation is enabled)
      */
-    uint8_t touch_data[(TPS43_REG_REL_Y + 2) - TPS43_REG_GESTURE_EVENTS_0];
-    ret = read_sequence_registers(dev, TPS43_REG_GESTURE_EVENTS_0, touch_data,
-                                  sizeof(touch_data));
+    size_t read_len = config->drag_continuation ?
+                      ((TPS43_REG_ABS_Y + 2) - TPS43_REG_GESTURE_EVENTS_0) :
+                      ((TPS43_REG_REL_Y + 2) - TPS43_REG_GESTURE_EVENTS_0);
+
+    uint8_t touch_data[13];
+    ret = read_sequence_registers(dev, TPS43_REG_GESTURE_EVENTS_0, touch_data, read_len);
     if (ret < 0) {
         LOG_ERR("Touch data read error: %d", ret);
         goto done;
@@ -438,6 +491,36 @@ static void tps43_work_handler(struct k_work *work) {
     uint8_t num_fingers = touch_data[4];
     int16_t rel_x = (int16_t)((touch_data[5] << 8) | touch_data[6]);
     int16_t rel_y = (int16_t)((touch_data[7] << 8) | touch_data[8]);
+
+    if (config->drag_continuation && num_fingers >= 1) {
+        drv_data->last_abs_x = (uint16_t)((touch_data[9] << 8) | touch_data[10]);
+        drv_data->last_abs_y = (uint16_t)((touch_data[11] << 8) | touch_data[12]);
+    }
+
+    /* In-loop self-healing and continuation resumption */
+    if (drv_data->drag_continuation_active) {
+        k_work_cancel_delayable(&drv_data->drag_continuation_work);
+
+        if (num_fingers == 1) {
+            LOG_INF("Drag continuation resumed from reposition");
+            drv_data->drag_continuation_active = false;
+        } else {
+            LOG_INF("Continuation aborted by finger count (%d) -> Releasing button", num_fingers);
+            drv_data->drag_continuation_active = false;
+            drv_data->tap_drag_active = false;
+            drv_data->drag_active = false;
+            is_drag_active = false;
+            drv_data->tap_drag_state = TPS43_TAP_DRAG_IDLE;
+            if (drv_data->drag_button_pressed) {
+                drv_data->drag_button_pressed = false;
+                input_report_key(dev, INPUT_BTN_0, 0, true, K_FOREVER);
+            }
+        }
+    } else if (drv_data->drag_button_pressed && !is_drag_active && !drv_data->tap_drag_active) {
+        LOG_WRN("Orphaned drag button state detected -> Force clearing INPUT_BTN_0");
+        drv_data->drag_button_pressed = false;
+        input_report_key(dev, INPUT_BTN_0, 0, true, K_FOREVER);
+    }
 
     bool is_touching = (num_fingers > 0);
     if (is_touching != drv_data->touching) {
@@ -526,20 +609,47 @@ static void tps43_work_handler(struct k_work *work) {
 
     // Detect release of a 'press and hold' left press
     if ((!(gestures_events[0] & TPS43_PRESS_AND_HOLD)) && is_drag_active) {
-        LOG_INF("Press and hold end detected - RELEASE (RELEASE LEFT BUTTON)");
-        // release drag flag and release left mouse button
-        is_drag_active = false;
-        input_report_key(dev, INPUT_BTN_0, 0, true, K_FOREVER);   // release + sync
-    }
-
-    /* Release tap-drag lock when contact is lost */
-    if (drv_data->prev_num_fingers > 0 && num_fingers == 0) {
-        if (drv_data->tap_drag_active) {
-            LOG_INF("Tap-drag contact lost -> RELEASE LEFT BUTTON");
-            drv_data->tap_drag_active = false;
-            drv_data->tap_drag_state = TPS43_TAP_DRAG_IDLE;
+        if (num_fingers > 0) {
+            LOG_INF("Press and hold end detected while touching - RELEASE LEFT BUTTON");
+            is_drag_active = false;
             input_report_key(dev, INPUT_BTN_0, 0, true, K_FOREVER);
         }
+    }
+
+    /* Release tap-drag and drag lock when contact is lost */
+    if (drv_data->prev_num_fingers > 0 && num_fingers == 0) {
+        bool drag_is_active = drv_data->tap_drag_active || is_drag_active;
+
+        if (config->drag_continuation && drag_is_active &&
+            tps43_is_near_edge(config, drv_data->last_abs_x, drv_data->last_abs_y)) {
+
+            LOG_INF("Edge lift detected -> Arming drag continuation (%d ms)",
+                    config->drag_continuation_timeout_ms);
+            drv_data->drag_continuation_active = true;
+            k_work_reschedule(&drv_data->drag_continuation_work,
+                              K_MSEC(config->drag_continuation_timeout_ms));
+            /* Keep is_drag_active / tap_drag_active intact and do not emit button release */
+        } else {
+            if (drv_data->tap_drag_active || is_drag_active) {
+                LOG_INF("Drag contact lost -> RELEASE LEFT BUTTON");
+                drv_data->tap_drag_active = false;
+                is_drag_active = false;
+                drv_data->tap_drag_state = TPS43_TAP_DRAG_IDLE;
+                if (drv_data->drag_button_pressed) {
+                    drv_data->drag_button_pressed = false;
+                    input_report_key(dev, INPUT_BTN_0, 0, true, K_FOREVER);
+                } else {
+                    input_report_key(dev, INPUT_BTN_0, 0, true, K_FOREVER);
+                }
+            }
+        }
+    }
+
+    /* Track drag_button_pressed state when any drag mode is active */
+    if (drv_data->tap_drag_active || is_drag_active || drv_data->drag_continuation_active) {
+        drv_data->drag_button_pressed = true;
+    } else {
+        drv_data->drag_button_pressed = false;
     }
 
     if (rel_x != 0 || rel_y != 0) {
@@ -616,9 +726,17 @@ done:
 static int tps43_reset_values(const struct device *dev) {
     struct tps43_drv_data *drv_data = dev->data;
 
+    k_work_cancel_delayable(&drv_data->drag_continuation_work);
+    drv_data->drag_continuation_active = false;
+
     if (drv_data->touching) {
         drv_data->touching = false;
         input_report_key(dev, INPUT_BTN_TOUCH, 0, true, K_FOREVER);
+    }
+
+    if (drv_data->drag_button_pressed || drv_data->drag_active || drv_data->tap_drag_active) {
+        drv_data->drag_button_pressed = false;
+        input_report_key(dev, INPUT_BTN_0, 0, true, K_FOREVER);
     }
 
     drv_data->device_ready = false;
@@ -630,6 +748,8 @@ static int tps43_reset_values(const struct device *dev) {
     drv_data->touching = false;
     drv_data->touch_session_fingers = 0;
     drv_data->prev_num_fingers = 0;
+    drv_data->last_abs_x = 0;
+    drv_data->last_abs_y = 0;
 
     LOG_INF("Values reset");
     return 0;
@@ -1505,6 +1625,7 @@ static int tps43_init(const struct device *dev) {
     k_sem_init(&drv_data->lock, 1, 1);
 
     k_work_init(&drv_data->work, tps43_work_handler);
+    k_work_init_delayable(&drv_data->drag_continuation_work, tps43_drag_continuation_timeout);
 
     tps43_dump_registers(dev);
 
@@ -1521,6 +1642,10 @@ static int tps43_init(const struct device *dev) {
         .tap_drag_state = TPS43_TAP_DRAG_IDLE,                                                       \
         .tap_drag_up_time_ms = 0,                                                                    \
         .tap_drag_active = false,                                                                    \
+        .drag_continuation_active = false,                                                           \
+        .drag_button_pressed = false,                                                                \
+        .last_abs_x = 0,                                                                             \
+        .last_abs_y = 0,                                                                             \
         .suspended = false,                                                                          \
         .touching = false,                                                                           \
         .touch_session_fingers = 0,                                                                  \
@@ -1534,6 +1659,9 @@ static int tps43_init(const struct device *dev) {
         .single_tap = DT_INST_PROP(inst, single_tap),                                                \
         .tap_and_drag = DT_INST_PROP(inst, tap_and_drag),                                            \
         .tap_and_drag_delay_ms = DT_INST_PROP_OR(inst, tap_and_drag_delay_ms, 250),                  \
+        .drag_continuation = DT_INST_PROP_OR(inst, drag_continuation, false),                         \
+        .drag_continuation_timeout_ms = DT_INST_PROP_OR(inst, drag_continuation_timeout_ms, 250),    \
+        .drag_continuation_edge_buffer = DT_INST_PROP_OR(inst, drag_continuation_edge_buffer, 128),  \
         .press_and_hold = DT_INST_PROP(inst, press_and_hold),                                        \
         .two_finger_tap = DT_INST_PROP(inst, two_finger_tap),                                        \
         .three_finger_tap = DT_INST_PROP(inst, three_finger_tap),                                    \

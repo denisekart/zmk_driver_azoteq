@@ -211,6 +211,9 @@ struct tps43_config {
     bool single_tap;
     bool tap_and_drag;
     int16_t tap_and_drag_delay_ms;
+    bool drag_continuation;
+    int16_t drag_continuation_timeout_ms;
+    int16_t drag_continuation_edge_buffer;
     bool press_and_hold;
     bool two_finger_tap;
     bool three_finger_tap;
@@ -274,6 +277,7 @@ struct tps43_drv_data {
     struct k_sem lock;
     struct gpio_callback rdy_cb;
     struct k_work work;
+    struct k_work_delayable drag_continuation_work;
 
     bool device_ready;
     bool initialized;
@@ -281,6 +285,10 @@ struct tps43_drv_data {
     enum tps43_tap_drag_state tap_drag_state;
     int64_t tap_drag_up_time_ms;
     bool tap_drag_active;
+    bool drag_continuation_active;
+    bool drag_button_pressed;
+    uint16_t last_abs_x;
+    uint16_t last_abs_y;
     bool suspended;
     bool touching;
     int64_t last_three_finger_swipe_ms;

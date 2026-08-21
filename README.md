@@ -12,6 +12,7 @@ This driver should work with any IQS5XX-based trackpad (TPS43 or TPS65).
 - Touch reporting: finger contact is reported as `INPUT_BTN_TOUCH` (1 when one or more fingers are on the pad, 0 when all fingers are lifted).
 - Single tap: registered as left click.
 - Double-tap drag: tap then tap-and-hold to drag (left click lock while moving until lift-off, with zero single-tap latency).
+- Edge drag continuation: optional lift-and-reposition support at trackpad boundaries with configurable timeout and edge buffer.
 - Two-finger tap: registered as right click.
 - Three-finger tap: registered as middle click (INPUT_BTN_2 / INPUT_BTN_MIDDLE).
 - Press and hold: registered as continuous left click (drag).
