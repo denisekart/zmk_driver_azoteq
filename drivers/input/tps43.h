@@ -197,20 +197,12 @@ extern "C" {
 /* End communication window - MUST be called after each read (writing to invalid address 0xEEEE causes NACK) */
 #define TPS43_REG_END_COMM_WINDOW   0xEEEE
 
-enum tps43_tap_drag_state {
-    TPS43_TAP_DRAG_IDLE = 0,
-    TPS43_TAP_DRAG_FIRST_TAP,
-    TPS43_TAP_DRAG_ACTIVE,
-};
-
 struct tps43_config {
     struct i2c_dt_spec i2c_bus;
     struct gpio_dt_spec rdy_gpio;
     struct gpio_dt_spec rst_gpio;
 
     bool single_tap;
-    bool tap_and_drag;
-    int16_t tap_and_drag_delay_ms;
     bool drag_continuation;
     int16_t drag_continuation_timeout_ms;
     int16_t drag_continuation_edge_buffer;
@@ -282,9 +274,6 @@ struct tps43_drv_data {
     bool device_ready;
     bool initialized;
     bool drag_active;
-    enum tps43_tap_drag_state tap_drag_state;
-    int64_t tap_drag_up_time_ms;
-    bool tap_drag_active;
     bool drag_continuation_active;
     bool drag_button_pressed;
     uint16_t last_abs_x;

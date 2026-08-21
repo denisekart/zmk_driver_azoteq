@@ -109,19 +109,6 @@ properties:
     required: false
     description: Enable single tap gesture
 
-  tap-and-drag:
-    type: boolean
-    required: false
-    description: Enable double-tap-to-drag gesture (tap + tap-and-hold to drag)
-
-  tap-and-drag-delay-ms:
-    type: int
-    required: false
-    default: 200
-    description: >
-      Maximum interval in milliseconds between first tap lift and second tap contact
-      to engage the drag lock.
-
   drag-continuation:
     type: boolean
     required: false
@@ -130,13 +117,13 @@ properties:
   drag-continuation-timeout-ms:
     type: int
     required: false
-    default: 400
+    default: 800
     description: Maximum lift time in milliseconds allowed to reposition finger during edge drag.
 
   drag-continuation-edge-buffer:
     type: int
     required: false
-    default: 96
+    default: 128
     description: Border width in coordinate pixels defining the edge continuation trigger zone.
 
   two-finger-tap:
