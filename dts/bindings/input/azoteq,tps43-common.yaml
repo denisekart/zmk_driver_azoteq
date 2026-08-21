@@ -62,18 +62,18 @@ properties:
   x-resolution:
     type: int
     required: false
-    default: 2048
     description: |
       X axis resolution in pixels
-      Sets the trackpad X resolution. Default is 2048.
+      Sets the trackpad X resolution. Only written if explicitly set.
+      If not set, factory preset resolution (1024 for TPS43) is assumed.
 
   y-resolution:
     type: int
     required: false
-    default: 1792
     description: |
       Y axis resolution in pixels
-      Sets the trackpad Y resolution. Default is 1792.
+      Sets the trackpad Y resolution. Only written if explicitly set.
+      If not set, factory preset resolution (1024 for TPS43) is assumed.
 
   sensitivity:
     type: int
@@ -117,7 +117,7 @@ properties:
     description: Enable edge drag continuation with lift-and-reposition support.
 
   drag-continuation-timeout-ms:
-    type: int
+    type: int 
     required: false
     default: 600
     description: Maximum lift time in milliseconds allowed to reposition finger during edge drag.
@@ -125,8 +125,10 @@ properties:
   drag-continuation-edge-buffer:
     type: int
     required: false
-    default: 140
-    description: Border width in coordinate pixels defining the edge continuation trigger zone.
+    default: 80
+    description: >
+      Border width in coordinate pixels defining the edge continuation trigger zone
+      (default: 80 px, ~8% of trackpad boundary on default 1024x1024 resolution).
 
   two-finger-tap:
     type: boolean

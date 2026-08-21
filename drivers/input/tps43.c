@@ -382,8 +382,8 @@ static void tps43_handle_swipe(const struct device *dev, uint8_t num_fingers, in
  * @brief Checks if the given absolute coordinates are near the trackpad edge
  */
 static inline bool tps43_is_near_edge(const struct tps43_config *config, uint16_t x, uint16_t y) {
-    int16_t max_x = (config->x_resolution > 0) ? config->x_resolution : 2048;
-    int16_t max_y = (config->y_resolution > 0) ? config->y_resolution : 1792;
+    int16_t max_x = (config->x_resolution > 0) ? config->x_resolution : 1024;
+    int16_t max_y = (config->y_resolution > 0) ? config->y_resolution : 1024;
     int16_t buf = config->drag_continuation_edge_buffer;
 
     if (config->switch_xy) {
@@ -840,7 +840,7 @@ static int tps43_configure_device(const struct device *dev) {
         LOG_INF("Dynamic filter upper set: 0x%04X", (uint16_t)config->filter_dynamic_upper);
     }
 
-    // resolution configuration
+    // resolution configuration (only if set in DT)
     if (config->x_resolution > 0) {
         ret = tps43_i2c_write_reg16(dev, TPS43_REG_X_RESOLUTION,
                                     (uint16_t)config->x_resolution);
@@ -1625,7 +1625,7 @@ static int tps43_init(const struct device *dev) {
         .single_tap = DT_INST_PROP(inst, single_tap),                                                \
         .drag_continuation = DT_INST_PROP_OR(inst, drag_continuation, false),                         \
         .drag_continuation_timeout_ms = DT_INST_PROP_OR(inst, drag_continuation_timeout_ms, 600),    \
-        .drag_continuation_edge_buffer = DT_INST_PROP_OR(inst, drag_continuation_edge_buffer, 140),  \
+        .drag_continuation_edge_buffer = DT_INST_PROP_OR(inst, drag_continuation_edge_buffer, 80),   \
         .press_and_hold = DT_INST_PROP(inst, press_and_hold),                                        \
         .two_finger_tap = DT_INST_PROP(inst, two_finger_tap),                                        \
         .three_finger_tap = DT_INST_PROP(inst, three_finger_tap),                                    \
@@ -1648,8 +1648,8 @@ static int tps43_init(const struct device *dev) {
         .filter_dynamic_bottom = DT_INST_PROP_OR(inst, filter_dynamic_bottom, -1),                    \
         .filter_dynamic_lower = DT_INST_PROP_OR(inst, filter_dynamic_lower, -1),                     \
         .filter_dynamic_upper = DT_INST_PROP_OR(inst, filter_dynamic_upper, -1),                     \
-        .x_resolution = DT_INST_PROP_OR(inst, x_resolution, 2048),                                   \
-        .y_resolution = DT_INST_PROP_OR(inst, y_resolution, 1792),                                   \
+        .x_resolution = DT_INST_PROP_OR(inst, x_resolution, -1),                                     \
+        .y_resolution = DT_INST_PROP_OR(inst, y_resolution, -1),                                     \
         .swipe_initial_distance = DT_INST_PROP_OR(inst, swipe_initial_distance, -1),                 \
         .swipe_initial_time = DT_INST_PROP_OR(inst, swipe_initial_time, -1),                         \
         .swipe_angle = DT_INST_PROP_OR(inst, swipe_angle, -1),                                       \

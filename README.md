@@ -58,8 +58,8 @@ CONFIG_INPUT_TPS43=y
         // filter-dynamic-bottom=<7>;     /* Dynamic filter bottom beta (optional) */
         // filter-dynamic-lower=<6>;      /* Dynamic filter lower speed (optional) */
         // filter-dynamic-upper=<0xFA>;   /* Dynamic filter upper speed (optional) */
-        x-resolution=<2048>;            /* X resolution in pixels */
-        y-resolution=<1792>;            /* Y resolution in pixels */
+        // x-resolution=<1024>;           /* X resolution in pixels (optional, default: 1024) */
+        // y-resolution=<1024>;           /* Y resolution in pixels (optional, default: 1024) */
 
         // swipe-initial-distance=<500>;          /* Swipe initial distance in px (optional) */
         // swipe-initial-time=<200>;              /* Swipe initial time in ms (optional) */
