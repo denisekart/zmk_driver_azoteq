@@ -117,7 +117,7 @@ properties:
   tap-and-drag-delay-ms:
     type: int
     required: false
-    default: 250
+    default: 200
     description: >
       Maximum interval in milliseconds between first tap lift and second tap contact
       to engage the drag lock.
@@ -130,7 +130,7 @@ properties:
   drag-continuation-timeout-ms:
     type: int
     required: false
-    default: 350
+    default: 400
     description: Maximum lift time in milliseconds allowed to reposition finger during edge drag.
 
   drag-continuation-edge-buffer:
