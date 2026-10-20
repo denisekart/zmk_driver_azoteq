@@ -667,10 +667,13 @@ static void tps43_work_handler(struct k_work *work) {
     k_mutex_lock(&drv_data->lock, K_FOREVER);
 
     /*
-     * Read registers in a single I2C transaction instead of issuing several independent reads.
-     * When force touch is enabled, read up through TOUCH_STRENGTH (15 bytes).
-     * When drag continuation is enabled (and force touch is disabled), read up through ABS_Y (13 bytes).
-     * When neither is enabled, read 9 bytes up through REL_Y.
+     * Read the event block in a single I2C transaction: up through ABS_Y
+     * (13 bytes) when drag continuation or force touch is enabled, otherwise
+     * 9 bytes up through REL_Y. TOUCH_STRENGTH is fetched with a separate
+     * random read in the same window — the module firmware has only ever been
+     * observed to stream the event block reliably through ABS_Y, and the
+     * single-register random read is the transaction the boot register dump
+     * already proves works on this hardware.
      * Byte offsets into the buffer:
      *   [0] GESTURE_EVENTS_0   (0x000D)
      *   [1] GESTURE_EVENTS_1   (0x000E)
@@ -681,19 +684,27 @@ static void tps43_work_handler(struct k_work *work) {
      *   [7..8] REL_Y           (0x0014, big-endian)
      *   [9..10] ABS_X          (0x0016, big-endian, when drag continuation or force touch is enabled)
      *   [11..12] ABS_Y         (0x0018, big-endian, when drag continuation or force touch is enabled)
-     *   [13..14] TOUCH_STRENGTH (0x001A, big-endian, when force touch is enabled)
      */
     size_t read_len;
-    if (config->force_touch) {
-        read_len = (TPS43_REG_TOUCH_STRENGTH + 2) - TPS43_REG_GESTURE_EVENTS_0; /* 15 bytes */
-    } else if (config->drag_continuation) {
-        read_len = (TPS43_REG_ABS_Y + 2) - TPS43_REG_GESTURE_EVENTS_0;          /* 13 bytes */
+    if (config->force_touch || config->drag_continuation) {
+        read_len = (TPS43_REG_ABS_Y + 2) - TPS43_REG_GESTURE_EVENTS_0; /* 13 bytes */
     } else {
-        read_len = (TPS43_REG_REL_Y + 2) - TPS43_REG_GESTURE_EVENTS_0;          /* 9 bytes */
+        read_len = (TPS43_REG_REL_Y + 2) - TPS43_REG_GESTURE_EVENTS_0; /* 9 bytes */
     }
 
-    uint8_t touch_data[15];
+    uint8_t touch_data[13];
     ret = read_sequence_registers(dev, TPS43_REG_GESTURE_EVENTS_0, touch_data, read_len);
+
+    /* Strength-read failure degrades to 0: the zero-debounce in the force
+     * processor turns a persistently unreadable register into a release.
+     */
+    uint16_t strength_raw = 0;
+    if (ret == 0 && config->force_touch && touch_data[4] >= 1) {
+        uint8_t strength_buf[2];
+        if (read_sequence_registers(dev, TPS43_REG_TOUCH_STRENGTH, strength_buf, 2) == 0) {
+            strength_raw = (uint16_t)((strength_buf[0] << 8) | strength_buf[1]);
+        }
+    }
     /* Immediately free the trackpad so it begins the next capacitive sample cycle */
     tps43_end_communication_window(dev);
 
@@ -724,16 +735,12 @@ static void tps43_work_handler(struct k_work *work) {
 
     /* Runtime reset detection and recovery */
     if (unlikely(touch_data[2] & TPS43_SHOW_RESET)) {
-        uint8_t reset_cmd = TPS43_ACK_RESET;
-        if (touch_data[4] == 0) {
-            reset_cmd |= TPS43_AUTO_ATI;
-        }
-        LOG_WRN("Runtime reset detected on trackpad (fingers=%u), reconfiguring...", touch_data[4]);
-        tps43_i2c_write_reg8(dev, TPS43_REG_SYSTEM_CONTROL_0, reset_cmd);
-        tps43_end_communication_window(dev);
-        if (touch_data[4] == 0) {
-            k_sleep(K_MSEC(50));
-        }
+        /* AUTO_ATI is a persistent enable: always re-assert it, clearing it
+         * disables tuning until the next full init. Keep ACK + reconfigure in
+         * one window: the device stays in its setup window until closed.
+         */
+        LOG_WRN("Runtime reset detected on trackpad, reconfiguring...");
+        tps43_i2c_write_reg8(dev, TPS43_REG_SYSTEM_CONTROL_0, TPS43_ACK_RESET | TPS43_AUTO_ATI);
         tps43_configure_device(dev);
         tps43_end_communication_window(dev);
 
@@ -770,10 +777,7 @@ static void tps43_work_handler(struct k_work *work) {
         drv_data->last_abs_y = (uint16_t)((touch_data[11] << 8) | touch_data[12]);
     }
 
-    uint16_t touch_strength = 0;
-    if (config->force_touch) {
-        touch_strength = (uint16_t)((touch_data[13] << 8) | touch_data[14]);
-    }
+    uint16_t touch_strength = strength_raw;
 
     /* In-loop self-healing and continuation resumption */
     if (drv_data->drag_continuation_active) {
@@ -1493,7 +1497,9 @@ static int check_reset_and_reconfigure(const struct device *dev) {
 
     LOG_INF("Device ready after %d ms", wait_count * 100);
 
-    // after reset, set flag to acknowledge that reset was performed
+    // after reset, set flag to acknowledge that reset was performed.
+    // Stay inside the setup window: the config writes below and the closing
+    // register dump must land in the same window the ACK opened.
     if (sys_info & TPS43_SHOW_RESET) {
         LOG_INF("SHOW_RESET detected, sending ACK_RESET and enable ATI");
         ret = tps43_i2c_write_reg8(dev, TPS43_REG_SYSTEM_CONTROL_0, TPS43_ACK_RESET | TPS43_AUTO_ATI);
@@ -1501,8 +1507,7 @@ static int check_reset_and_reconfigure(const struct device *dev) {
             LOG_ERR("ACK_RESET send error: %d", ret);
             return ret;
         }
-        tps43_end_communication_window(dev);
-        k_sleep(K_MSEC(50));
+        k_sleep(K_MSEC(10));
     }
 
     ret = tps43_configure_device(dev);
