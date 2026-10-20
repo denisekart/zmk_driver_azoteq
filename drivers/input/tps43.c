@@ -440,7 +440,8 @@ static void tps43_drag_continuation_timeout(struct k_work *work) {
  * until the window is ready.
  */
 static void tps43_force_poll_work(struct k_work *work) {
-    struct tps43_drv_data *drv_data = CONTAINER_OF(work, struct tps43_drv_data, force_poll_work);
+    struct k_work_delayable *dwork = k_work_delayable_from_work(work);
+    struct tps43_drv_data *drv_data = CONTAINER_OF(dwork, struct tps43_drv_data, force_poll_work);
     const struct device *dev = drv_data->dev;
 
     if (k_mutex_lock(&drv_data->lock, K_MSEC(20)) != 0) {
