@@ -293,6 +293,7 @@ struct tps43_drv_data {
     uint16_t force_peak_strength;
     uint16_t force_settle_samples[3];
     uint8_t force_sample_count;
+    uint8_t force_press_confirm;
     uint8_t force_zero_count;
     bool force_pressed;
 };

@@ -11,7 +11,7 @@ This driver should work with any IQS5XX-based trackpad (TPS43 or TPS65).
 - Trackpad movement.
 - Touch reporting: finger contact is reported as `INPUT_BTN_TOUCH` (1 when one or more fingers are on the pad, 0 when all fingers are lifted).
 - Single tap: registered as left click.
-- Single-finger Force Touch: dynamic adaptive pressure click mimicking Apple trackpads (press down to click/drag, release force to unclick while maintaining touch).
+- Single-finger Force Touch: dynamic adaptive pressure click mimicking Apple trackpads (a deliberate push clicks/drags, a resting touch never does; release force to unclick while maintaining touch).
 - Edge drag continuation: optional lift-and-reposition support at trackpad boundaries with configurable timeout and edge buffer.
 - Two-finger tap: registered as right click.
 - Three-finger tap: registered as middle click (INPUT_BTN_2 / INPUT_BTN_MIDDLE).
@@ -76,9 +76,9 @@ CONFIG_INPUT_TPS43=y
         two-finger-tap;
         // three-finger-tap;                    /* 3-finger tap (middle click INPUT_BTN_2) (optional) */
         single-tap;
-        // force-touch;                         /* Single-finger Force Touch click (optional) */
-        // force-touch-pressure-delta=<300>;    /* Force touch activation delta (optional, default 300) */
-        // force-touch-hysteresis=<120>;        /* Force touch release hysteresis (optional, default 120) */
+        // force-touch;                         /* Single-finger Force Touch click: deliberate push actuates, resting touch never does (optional) */
+        // force-touch-pressure-delta=<500>;    /* Force touch activation delta in raw strength counts (optional, default 500) */
+        // force-touch-hysteresis=<200>;        /* Force touch release hysteresis (optional, default 200) */
         press-and-hold;
         swipes;
         // three-finger-swipe;                    /* 3-finger swipe only, without enabling 1-finger swipe (optional) */

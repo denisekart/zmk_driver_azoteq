@@ -138,15 +138,18 @@ properties:
   force-touch-pressure-delta:
     type: int
     required: false
-    default: 300
+    default: 500
     description: |
-      Conservative raw pressure delta above dynamic baseline required to trigger
-      a force press. Prevents accidental clicks during normal movement.
+      Raw TOUCH_STRENGTH counts above the dynamic baseline required to
+      trigger a force press, confirmed over two consecutive samples. The
+      baseline fast-tracks post-touchdown contact flattening, so a resting
+      touch of any steady weight never actuates; only a deliberate push
+      does. Field-tune per module.
 
   force-touch-hysteresis:
     type: int
     required: false
-    default: 120
+    default: 200
     description: |
       Hysteresis subtracted from press threshold to trigger force release.
 

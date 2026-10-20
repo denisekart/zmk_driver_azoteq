@@ -431,27 +431,19 @@ static void tps43_drag_continuation_timeout(struct k_work *work) {
 }
 
 /**
- * @brief Periodic force-sample poll while a single finger is down
+ * @brief Periodic force-sample poll while a single motionless finger is down
  *
  * Touch strength is not an event source (datasheet 8.8.1): a stationary
  * force press leaves the sensor event-silent, so a press triggered by a
- * mid-motion frame could never be released. Datasheet 8.8.2 allows
- * master-forced communication at any time; the device clock-stretches
- * until the window is ready.
+ * mid-motion frame could never be released. The work handler's
+ * random-address event read is itself a forced communication (datasheet
+ * 8.8.2) — the same transaction the boot register dump uses — so the poll
+ * only needs to re-submit the handler; no separate handshake, no mutex
+ * hold, no extra window open/close on the sample path.
  */
 static void tps43_force_poll_work(struct k_work *work) {
-    struct k_work_delayable *dwork = k_work_delayable_from_work(work);
-    struct tps43_drv_data *drv_data = CONTAINER_OF(dwork, struct tps43_drv_data, force_poll_work);
-    const struct device *dev = drv_data->dev;
-
-    if (k_mutex_lock(&drv_data->lock, K_MSEC(20)) != 0) {
-        k_work_reschedule(&drv_data->force_poll_work, K_MSEC(10));
-        return;
-    }
-    tps43_force_communication(dev);
-    k_sleep(K_MSEC(1)); /* >=200uS before next transaction (datasheet 8.8.2) */
-    tps43_end_communication_window(dev);
-    k_mutex_unlock(&drv_data->lock);
+    struct tps43_drv_data *drv_data =
+        CONTAINER_OF(k_work_delayable_from_work(work), struct tps43_drv_data, force_poll_work);
 
     k_work_submit(&drv_data->work);
 }
@@ -478,13 +470,13 @@ static inline uint16_t tps43_median3(uint16_t a, uint16_t b, uint16_t c) {
 /**
  * @brief Processes single-finger force touch pressure and updates button state
  *
- * Implements an integer-only adaptive baseline algorithm:
  * - Settles past landing impact transients during initial 3 frames using median filter
  * - Motion gating: suppresses false click triggers during active cursor movement
  * - Slope gating: requires positive pressure derivative for initial press trigger
- * - Fast-tracks lighter touches down and slow-drifts (EMA) up during resting/stationary states
- * - Freezes upward baseline drift during active movement and clamps drift relative to touchdown
- * - Freezes baseline during active force press
+ * - Two-frame confirmation: a single-sample spike never actuates
+ * - Fast tracking down, 1/4-rate tracking up (absorbs post-touchdown contact
+ *   flattening that would otherwise read as phantom pressure) while resting,
+ *   clamped relative to touchdown; frozen during an active force press
  * - Dynamic bounded hysteresis on release and 2-frame debounce for zero-strength anomalies
  *
  * @param dev Pointer to trackpad device
@@ -520,6 +512,7 @@ static void tps43_process_force_touch(const struct device *dev,
             }
         }
         drv_data->force_sample_count = 0;
+        drv_data->force_press_confirm = 0;
         drv_data->force_zero_count = 0;
         drv_data->force_baseline = 0;
         drv_data->force_initial_baseline = 0;
@@ -528,7 +521,17 @@ static void tps43_process_force_touch(const struct device *dev,
 
     if (num_fingers == 0) {
         drv_data->force_sample_count = 0;
+        drv_data->force_press_confirm = 0;
         drv_data->force_zero_count = 0;
+        return;
+    }
+
+    /* Frames that skipped the strength read (motion, unpressed) carry no
+     * sample: a zero here must not track the baseline down or settle on it.
+     * While pressed, zero still flows through: the zero-debounce below is
+     * the release path for a persistently unreadable strength register.
+     */
+    if (touch_strength == 0 && !drv_data->force_pressed) {
         return;
     }
 
@@ -560,30 +563,42 @@ static void tps43_process_force_touch(const struct device *dev,
         /* Slope gating: require non-negative derivative (rising/flat pressure) for actuation */
         bool is_rising_slope = (touch_strength >= drv_data->force_last_strength);
 
-        /* Check for force press */
         if (is_stationary_or_slow && is_rising_slope &&
             touch_strength >= (drv_data->force_baseline + config->force_touch_delta)) {
-            drv_data->force_pressed = true;
-            drv_data->force_peak_strength = touch_strength;
-            drv_data->force_zero_count = 0;
-            LOG_DBG("Force Press: Raw=%u, Base=%u, Delta=%u (Thresh=%u)",
-                    touch_strength, drv_data->force_baseline,
-                    (uint16_t)(touch_strength - drv_data->force_baseline),
-                    config->force_touch_delta);
-            if (!(*is_drag_active) && !drv_data->drag_continuation_active) {
-                input_report_key(dev, INPUT_BTN_0, 1, true, K_FOREVER);
+            /* Two-frame confirmation rejects single-sample spikes */
+            drv_data->force_press_confirm++;
+            if (drv_data->force_press_confirm >= 2) {
+                drv_data->force_pressed = true;
+                drv_data->force_press_confirm = 0;
+                drv_data->force_peak_strength = touch_strength;
+                drv_data->force_zero_count = 0;
+                LOG_DBG("Force Press: Raw=%u, Base=%u, Delta=%u (Thresh=%u)",
+                        touch_strength, drv_data->force_baseline,
+                        (uint16_t)(touch_strength - drv_data->force_baseline),
+                        config->force_touch_delta);
+                if (!(*is_drag_active) && !drv_data->drag_continuation_active) {
+                    input_report_key(dev, INPUT_BTN_0, 1, true, K_FOREVER);
+                }
             }
-        } else if (touch_strength < drv_data->force_baseline) {
-            /* Fast tracking lighter touch - immediately track lower resting contact */
-            drv_data->force_baseline = touch_strength;
-        } else if (move_x <= 2 && move_y <= 2 &&
-                   touch_strength < (drv_data->force_baseline + (config->force_touch_delta >> 1))) {
-            /* Damped upward baseline drift (1/64 rate) only when stationary/slow */
-            uint16_t max_allowed_baseline = drv_data->force_initial_baseline + (config->force_touch_delta >> 2);
-            if (drv_data->force_baseline < max_allowed_baseline) {
-                drv_data->force_baseline += (touch_strength - drv_data->force_baseline) >> 6;
-                if (drv_data->force_baseline > max_allowed_baseline) {
-                    drv_data->force_baseline = max_allowed_baseline;
+        } else {
+            drv_data->force_press_confirm = 0;
+            if (touch_strength < drv_data->force_baseline) {
+                /* Fast tracking lighter touch - immediately track lower resting contact */
+                drv_data->force_baseline = touch_strength;
+            } else if (move_x <= 2 && move_y <= 2 &&
+                       touch_strength < (drv_data->force_baseline + (config->force_touch_delta >> 1))) {
+                /* Upward baseline tracking at 1/4 rate absorbs the contact
+                 * flattening ramp that follows touchdown; without it that
+                 * ramp accumulates as phantom delta and false-actuates.
+                 * The delta/2 exclusion band keeps a deliberate press out
+                 * of the tracker.
+                 */
+                uint16_t max_allowed_baseline = drv_data->force_initial_baseline + (config->force_touch_delta >> 2);
+                if (drv_data->force_baseline < max_allowed_baseline) {
+                    drv_data->force_baseline += (touch_strength - drv_data->force_baseline) >> 2;
+                    if (drv_data->force_baseline > max_allowed_baseline) {
+                        drv_data->force_baseline = max_allowed_baseline;
+                    }
                 }
             }
         }
@@ -621,6 +636,7 @@ static void tps43_process_force_touch(const struct device *dev,
 
         if (force_zero_release || force_threshold_release) {
             drv_data->force_pressed = false;
+            drv_data->force_press_confirm = 0;
             drv_data->force_zero_count = 0;
             LOG_DBG("Force Release: Raw=%u, Base=%u, Peak=%u (ReleaseThresh=%u)",
                     touch_strength, drv_data->force_baseline,
@@ -694,12 +710,25 @@ static void tps43_work_handler(struct k_work *work) {
 
     uint8_t touch_data[13];
     ret = read_sequence_registers(dev, TPS43_REG_GESTURE_EVENTS_0, touch_data, read_len);
+    if (ret < 0 && config->force_touch) {
+        /* Poll-originated reads are forced and may NACK once while the
+         * device is mid-cycle; one retry protects an active press or drag
+         * from a spurious error teardown.
+         */
+        ret = read_sequence_registers(dev, TPS43_REG_GESTURE_EVENTS_0, touch_data, read_len);
+    }
 
-    /* Strength-read failure degrades to 0: the zero-debounce in the force
-     * processor turns a persistently unreadable register into a release.
+    /* Strength is only actionable when the processor can use it: while
+     * unpressed, motion frames are trigger-gated anyway, so skip the extra
+     * transaction and let the sample read as zero (= no sample).
+     * Strength-read failure likewise degrades to 0: the zero-debounce in
+     * the force processor turns a persistently unreadable register into a
+     * release.
      */
     uint16_t strength_raw = 0;
-    if (ret == 0 && config->force_touch && touch_data[4] >= 1) {
+    bool frame_motion = touch_data[5] || touch_data[6] || touch_data[7] || touch_data[8];
+    if (ret == 0 && config->force_touch && touch_data[4] >= 1 &&
+        (drv_data->force_pressed || !frame_motion)) {
         uint8_t strength_buf[2];
         if (read_sequence_registers(dev, TPS43_REG_TOUCH_STRENGTH, strength_buf, 2) == 0) {
             strength_raw = (uint16_t)((strength_buf[0] << 8) | strength_buf[1]);
@@ -725,6 +754,7 @@ static void tps43_work_handler(struct k_work *work) {
         drv_data->touch_session_fingers = 0;
         drv_data->prev_num_fingers = 0;
         drv_data->force_sample_count = 0;
+        drv_data->force_press_confirm = 0;
         drv_data->force_zero_count = 0;
         drv_data->force_baseline = 0;
         drv_data->force_initial_baseline = 0;
@@ -759,6 +789,7 @@ static void tps43_work_handler(struct k_work *work) {
         drv_data->touch_session_fingers = 0;
         drv_data->prev_num_fingers = 0;
         drv_data->force_sample_count = 0;
+        drv_data->force_press_confirm = 0;
         drv_data->force_zero_count = 0;
         drv_data->force_baseline = 0;
         drv_data->force_initial_baseline = 0;
@@ -950,6 +981,7 @@ static void tps43_work_handler(struct k_work *work) {
     if (num_fingers == 0) {
         drv_data->touch_session_fingers = 0;
         drv_data->force_sample_count = 0;
+        drv_data->force_press_confirm = 0;
         drv_data->force_zero_count = 0;
         if (!drv_data->drag_continuation_active) {
             drv_data->force_baseline = 0;
@@ -961,10 +993,13 @@ static void tps43_work_handler(struct k_work *work) {
 
     drv_data->prev_num_fingers = num_fingers;
 
-    /* Pressure changes are not an event source: keep sampling while a
-     * single finger is down even if the sensor stays event-silent.
+    /* Pressure changes are not an event source: a resting single finger
+     * leaves the sensor silent, so poll it. During movement the RDY frames
+     * already carry fresh strength; a held press keeps polling so release
+     * can fire once the finger rests again.
      */
-    if (config->force_touch && num_fingers == 1) {
+    if (config->force_touch && num_fingers == 1 &&
+        (drv_data->force_pressed || ((rel_x < 0 ? -rel_x : rel_x) + (rel_y < 0 ? -rel_y : rel_y)) <= 8)) {
         k_work_reschedule(&drv_data->force_poll_work, K_MSEC(40));
     } else {
         k_work_cancel_delayable(&drv_data->force_poll_work);
@@ -1021,6 +1056,7 @@ static int tps43_reset_values(const struct device *dev) {
     drv_data->force_settle_samples[1] = 0;
     drv_data->force_settle_samples[2] = 0;
     drv_data->force_sample_count = 0;
+    drv_data->force_press_confirm = 0;
     drv_data->force_zero_count = 0;
     drv_data->force_pressed = false;
 
@@ -1929,6 +1965,7 @@ static int tps43_init(const struct device *dev) {
         .force_peak_strength = 0,                                                                    \
         .force_settle_samples = {0, 0, 0},                                                           \
         .force_sample_count = 0,                                                                     \
+        .force_press_confirm = 0,                                                                    \
         .force_zero_count = 0,                                                                       \
         .force_pressed = false,                                                                      \
     };                                                                                               \
