@@ -273,6 +273,18 @@ struct tps43_drv_data {
     struct k_work_delayable touch_release_work;
     struct k_work_delayable reconfigure_work;
 
+    bool initialized;
+    bool drag_active;
+    bool drag_continuation_active;
+    bool drag_button_pressed;
+    uint16_t last_abs_x;
+    uint16_t last_abs_y;
+    bool suspended;
+    bool touching;
+    int64_t last_three_finger_swipe_ms;
+    uint8_t touch_session_fingers;
+    uint8_t prev_num_fingers;
+
     bool needs_reconfigure; /* latch: chip reset landed while suspended */
     uint8_t i2c_err_count;  /* consecutive burst-read failures, for log throttle */
 };
