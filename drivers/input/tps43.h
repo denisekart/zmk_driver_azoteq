@@ -288,14 +288,14 @@ struct tps43_drv_data {
     uint8_t touch_session_fingers;
     uint8_t prev_num_fingers;
     uint16_t force_baseline;
-    uint16_t force_initial_baseline;
-    uint16_t force_last_strength;
     uint16_t force_peak_strength;
-    uint16_t force_settle_samples[3];
-    uint8_t force_sample_count;
+    uint8_t force_phase; /* 0 unseeded, 1 touchdown grace, 2 armed */
+    int64_t force_touchdown_ms;
     uint8_t force_press_confirm;
     uint8_t force_zero_count;
     bool force_pressed;
+    uint8_t probe_fingers; /* last confirmed finger count; drives self-heal poll */
+    uint16_t probe_failures;
 };
 
 int tps43_set_sleep(const struct device *dev, bool sleep);
