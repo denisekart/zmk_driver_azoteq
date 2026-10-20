@@ -206,6 +206,9 @@ struct tps43_config {
     bool drag_continuation;
     int16_t drag_continuation_timeout_ms;
     int16_t drag_continuation_edge_buffer;
+    bool force_touch;
+    int16_t force_touch_delta;
+    int16_t force_touch_hysteresis;
     bool press_and_hold;
     bool two_finger_tap;
     bool three_finger_tap;
@@ -283,6 +286,14 @@ struct tps43_drv_data {
     int64_t last_three_finger_swipe_ms;
     uint8_t touch_session_fingers;
     uint8_t prev_num_fingers;
+    uint16_t force_baseline;
+    uint16_t force_initial_baseline;
+    uint16_t force_last_strength;
+    uint16_t force_peak_strength;
+    uint16_t force_settle_samples[3];
+    uint8_t force_sample_count;
+    uint8_t force_zero_count;
+    bool force_pressed;
 };
 
 int tps43_set_sleep(const struct device *dev, bool sleep);

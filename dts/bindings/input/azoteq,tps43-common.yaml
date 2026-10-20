@@ -130,6 +130,26 @@ properties:
       Border width in coordinate pixels defining the edge continuation trigger zone
       (default: 80 px, ~8% of trackpad boundary on default 1024x1024 resolution).
 
+  force-touch:
+    type: boolean
+    required: false
+    description: Enable single-finger dynamic force touch click functionality.
+
+  force-touch-pressure-delta:
+    type: int
+    required: false
+    default: 300
+    description: |
+      Conservative raw pressure delta above dynamic baseline required to trigger
+      a force press. Prevents accidental clicks during normal movement.
+
+  force-touch-hysteresis:
+    type: int
+    required: false
+    default: 120
+    description: |
+      Hysteresis subtracted from press threshold to trigger force release.
+
   two-finger-tap:
     type: boolean
     required: false
