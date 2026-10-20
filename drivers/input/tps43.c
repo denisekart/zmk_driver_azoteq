@@ -242,6 +242,10 @@ static int tps43_set_suspend_internal(const struct device *dev, bool suspend, bo
         input_report_key(dev, INPUT_BTN_TOUCH, 0, true, K_FOREVER);
     }
 
+    if (suspend) {
+        k_work_cancel_delayable(&drv_data->force_poll_work);
+    }
+
     if (suspend && (drv_data->drag_active || drv_data->drag_continuation_active || drv_data->drag_button_pressed || drv_data->force_pressed)) {
         k_work_cancel_delayable(&drv_data->drag_continuation_work);
         drv_data->drag_continuation_active = false;
@@ -427,6 +431,31 @@ static void tps43_drag_continuation_timeout(struct k_work *work) {
 }
 
 /**
+ * @brief Periodic force-sample poll while a single finger is down
+ *
+ * Touch strength is not an event source (datasheet 8.8.1): a stationary
+ * force press leaves the sensor event-silent, so a press triggered by a
+ * mid-motion frame could never be released. Datasheet 8.8.2 allows
+ * master-forced communication at any time; the device clock-stretches
+ * until the window is ready.
+ */
+static void tps43_force_poll_work(struct k_work *work) {
+    struct tps43_drv_data *drv_data = CONTAINER_OF(work, struct tps43_drv_data, force_poll_work);
+    const struct device *dev = drv_data->dev;
+
+    if (k_mutex_lock(&drv_data->lock, K_MSEC(20)) != 0) {
+        k_work_reschedule(&drv_data->force_poll_work, K_MSEC(10));
+        return;
+    }
+    tps43_force_communication(dev);
+    k_sleep(K_MSEC(1)); /* >=200uS before next transaction (datasheet 8.8.2) */
+    tps43_end_communication_window(dev);
+    k_mutex_unlock(&drv_data->lock);
+
+    k_work_submit(&drv_data->work);
+}
+
+/**
  * @brief Computes median of three 16-bit unsigned integers
  *
  * Uses optimal comparison tree (maximum 3 comparisons, integer-only, zero floating point).
@@ -462,7 +491,6 @@ static inline uint16_t tps43_median3(uint16_t a, uint16_t b, uint16_t c) {
  * @param touch_strength 16-bit raw touch strength value from sensor
  * @param rel_x Relative X movement reported this frame
  * @param rel_y Relative Y movement reported this frame
- * @param was_continuation Whether drag continuation was active when finger touched down
  * @param is_drag_active Pointer to is_drag_active flag in work handler
  */
 static void tps43_process_force_touch(const struct device *dev,
@@ -470,7 +498,6 @@ static void tps43_process_force_touch(const struct device *dev,
                                       uint16_t touch_strength,
                                       int16_t rel_x,
                                       int16_t rel_y,
-                                      bool was_continuation,
                                       bool *is_drag_active) {
     const struct tps43_config *config = dev->config;
     struct tps43_drv_data *drv_data = dev->data;
@@ -747,8 +774,6 @@ static void tps43_work_handler(struct k_work *work) {
         touch_strength = (uint16_t)((touch_data[13] << 8) | touch_data[14]);
     }
 
-    bool was_continuation = drv_data->drag_continuation_active;
-
     /* In-loop self-healing and continuation resumption */
     if (drv_data->drag_continuation_active) {
         k_work_cancel_delayable(&drv_data->drag_continuation_work);
@@ -810,7 +835,7 @@ static void tps43_work_handler(struct k_work *work) {
                 input_report_key(dev, INPUT_BTN_1, 0, true, K_FOREVER);
             }
         }
-        if ((gestures_events[0] & TPS43_PRESS_AND_HOLD) && !is_drag_active) {
+        if ((gestures_events[0] & TPS43_PRESS_AND_HOLD) && !is_drag_active && !drv_data->force_pressed) {
             LOG_DBG("Press and hold detected - DRAG (HOLD LEFT BUTTON)");
             // set internal drag flag and press left mouse button
             is_drag_active = true;
@@ -827,7 +852,7 @@ static void tps43_work_handler(struct k_work *work) {
     }
 
     /* Process dynamic force touch */
-    tps43_process_force_touch(dev, num_fingers, touch_strength, rel_x, rel_y, was_continuation, &is_drag_active);
+    tps43_process_force_touch(dev, num_fingers, touch_strength, rel_x, rel_y, &is_drag_active);
 
     /* Release drag lock when contact is lost */
     if (drv_data->prev_num_fingers > 0 && num_fingers == 0) {
@@ -931,6 +956,15 @@ static void tps43_work_handler(struct k_work *work) {
 
     drv_data->prev_num_fingers = num_fingers;
 
+    /* Pressure changes are not an event source: keep sampling while a
+     * single finger is down even if the sensor stays event-silent.
+     */
+    if (config->force_touch && num_fingers == 1) {
+        k_work_reschedule(&drv_data->force_poll_work, K_MSEC(40));
+    } else {
+        k_work_cancel_delayable(&drv_data->force_poll_work);
+    }
+
 done:
     // Save for next call
     drv_data->drag_active = is_drag_active;
@@ -952,6 +986,7 @@ static int tps43_reset_values(const struct device *dev) {
     struct tps43_drv_data *drv_data = dev->data;
 
     k_work_cancel_delayable(&drv_data->drag_continuation_work);
+    k_work_cancel_delayable(&drv_data->force_poll_work);
     drv_data->drag_continuation_active = false;
 
     if (drv_data->touching) {
@@ -1795,6 +1830,7 @@ static int tps43_init(const struct device *dev) {
     k_mutex_init(&drv_data->lock);
     k_work_init(&drv_data->work, tps43_work_handler);
     k_work_init_delayable(&drv_data->drag_continuation_work, tps43_drag_continuation_timeout);
+    k_work_init_delayable(&drv_data->force_poll_work, tps43_force_poll_work);
 
     ret = tps43_reset_values(dev);
     if (ret != 0) {

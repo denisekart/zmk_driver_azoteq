@@ -273,6 +273,7 @@ struct tps43_drv_data {
     struct gpio_callback rdy_cb;
     struct k_work work;
     struct k_work_delayable drag_continuation_work;
+    struct k_work_delayable force_poll_work;
 
     bool device_ready;
     bool initialized;
