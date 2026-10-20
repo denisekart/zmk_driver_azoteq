@@ -84,7 +84,7 @@ properties:
   scroll-sensitivity:
     type: int
     required: false
-    default: 50
+    default: 100
     description: Scroll sensitivity percentage (100 = normal, higher = more sensitive)
 
   zoom-sensitivity:
@@ -129,29 +129,6 @@ properties:
     description: >
       Border width in coordinate pixels defining the edge continuation trigger zone
       (default: 80 px, ~8% of trackpad boundary on default 1024x1024 resolution).
-
-  force-touch:
-    type: boolean
-    required: false
-    description: Enable single-finger dynamic force touch click functionality.
-
-  force-touch-pressure-delta:
-    type: int
-    required: false
-    default: 500
-    description: |
-      Raw TOUCH_STRENGTH counts above the dynamic baseline required to
-      trigger a force press, confirmed over two consecutive samples. The
-      baseline fast-tracks post-touchdown contact flattening, so a resting
-      touch of any steady weight never actuates; only a deliberate push
-      does. Field-tune per module.
-
-  force-touch-hysteresis:
-    type: int
-    required: false
-    default: 200
-    description: |
-      Hysteresis subtracted from press threshold to trigger force release.
 
   two-finger-tap:
     type: boolean

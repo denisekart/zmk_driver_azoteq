@@ -9,8 +9,6 @@
 #include <zephyr/input/input.h>
 #include <zephyr/dt-bindings/input/input-event-codes.h>
 #include <zephyr/logging/log.h>
-#include <stdlib.h>
-#include <math.h>
 #include <errno.h>
 
 #include "tps43.h"
@@ -206,6 +204,57 @@ static void tps43_force_communication(const struct device *dev) {
     tps43_i2c_read_reg8_w_err(dev, TPS43_REG_SYSTEM_CONTROL_1, &control_reg, false);
 }
 
+/* TOUCH/BTN_0 releases are one BLE split packet away from being lost during
+ * wake/link re-establishment; a lost release pins the layer keyed on INPUT_BTN_TOUCH
+ * or leaves a stuck left-click on the host. Re-emit shortly after every
+ * synthesized release that ends a session or drag. */
+#define TPS43_TOUCH_RELEASE_RETRY_MS 250
+
+static void tps43_touch_release_retry(struct k_work *work) {
+    struct k_work_delayable *dwork = k_work_delayable_from_work(work);
+    struct tps43_drv_data *drv_data =
+        CONTAINER_OF(dwork, struct tps43_drv_data, touch_release_work);
+
+    /* Skip if state moved on since: a stray 0 mid-touch would drop the layer
+     * with no 1->0 edge to re-assert it, and a stray 0 while a drag owner
+     * still holds BTN_0 would cancel a live drag. */
+    if (!drv_data->touching) {
+        input_report_key(drv_data->dev, INPUT_BTN_TOUCH, 0, true, K_FOREVER);
+    }
+    if (!drv_data->drag_active && !drv_data->drag_continuation_active) {
+        input_report_key(drv_data->dev, INPUT_BTN_0, 0, true, K_FOREVER);
+    }
+}
+
+static void tps43_release_touch(const struct device *dev) {
+    struct tps43_drv_data *drv_data = dev->data;
+
+    drv_data->touching = false;
+    input_report_key(dev, INPUT_BTN_TOUCH, 0, true, K_FOREVER);
+    k_work_reschedule(&drv_data->touch_release_work, K_MSEC(TPS43_TOUCH_RELEASE_RETRY_MS));
+}
+
+/* Tear down the touch session on I2C failure or chip reset: a dangling
+ * TOUCH/BTN_0 release lost on the BLE hop pins the central's layer. */
+static void tps43_teardown_session(struct tps43_drv_data *drv_data) {
+    const struct device *dev = drv_data->dev;
+
+    if (drv_data->touching) {
+        tps43_release_touch(dev);
+    }
+    if (drv_data->drag_button_pressed || drv_data->drag_active ||
+        drv_data->drag_continuation_active) {
+        k_work_cancel_delayable(&drv_data->drag_continuation_work);
+        drv_data->drag_continuation_active = false;
+        drv_data->drag_active = false;
+        drv_data->drag_button_pressed = false;
+        input_report_key(dev, INPUT_BTN_0, 0, true, K_FOREVER);
+        k_work_reschedule(&drv_data->touch_release_work, K_MSEC(TPS43_TOUCH_RELEASE_RETRY_MS));
+    }
+    drv_data->touch_session_fingers = 0;
+    drv_data->prev_num_fingers = 0;
+}
+
 /**
  * @brief Internal function to put trackpad into suspend/resume mode
  *
@@ -230,31 +279,40 @@ static int tps43_set_suspend_internal(const struct device *dev, bool suspend, bo
 
     // Acquire mutex if not already held
     if (!lock_held) {
-        if (k_mutex_lock(&drv_data->lock, K_MSEC(100)) != 0) {
+        int err = -EBUSY;
+        for (int attempt = 0; attempt < 3; attempt++) {
+            err = k_mutex_lock(&drv_data->lock, K_MSEC(50));
+            if (err == 0) {
+                break;
+            }
+        }
+        if (err != 0) {
             LOG_WRN("Failed to acquire mutex for suspend/resume");
             return -EBUSY;
         }
     }
 
-    // Release touch if device is suspended while touching was active
-    if (suspend && drv_data->touching) {
-        drv_data->touching = false;
-        input_report_key(dev, INPUT_BTN_TOUCH, 0, true, K_FOREVER);
-    }
-
+    /* Synthesized releases run under the lock: a lockless read of the gate
+     * flags can sample a handler mid-assert (TOUCH/BTN_0 1 emitted, its
+     * end-of-handler flag update pending) and strand that press across the
+     * sleep. A failed lock aborts the suspend above, so no release is owed
+     * on that leg. */
     if (suspend) {
-        k_work_cancel_delayable(&drv_data->force_poll_work);
-        drv_data->probe_fingers = 0;
-    }
+        if (drv_data->touching) {
+            tps43_release_touch(dev);
+        }
 
-    if (suspend && (drv_data->drag_active || drv_data->drag_continuation_active || drv_data->drag_button_pressed || drv_data->force_pressed)) {
-        k_work_cancel_delayable(&drv_data->drag_continuation_work);
-        drv_data->drag_continuation_active = false;
-        drv_data->drag_active = false;
-        drv_data->force_pressed = false;
-        if (drv_data->drag_button_pressed) {
-            drv_data->drag_button_pressed = false;
-            input_report_key(dev, INPUT_BTN_0, 0, true, K_FOREVER);
+        if (drv_data->drag_active || drv_data->drag_continuation_active ||
+            drv_data->drag_button_pressed) {
+            k_work_cancel_delayable(&drv_data->drag_continuation_work);
+            drv_data->drag_continuation_active = false;
+            drv_data->drag_active = false;
+            if (drv_data->drag_button_pressed) {
+                drv_data->drag_button_pressed = false;
+                input_report_key(dev, INPUT_BTN_0, 0, true, K_FOREVER);
+                k_work_reschedule(&drv_data->touch_release_work,
+                                  K_MSEC(TPS43_TOUCH_RELEASE_RETRY_MS));
+            }
         }
     }
 
@@ -306,8 +364,10 @@ static int tps43_set_suspend_internal(const struct device *dev, bool suspend, bo
     drv_data->suspended = suspend;
 
 done:
-    // Enable RDY interrupts after resume
-    if (!suspend && config->rdy_gpio.port != NULL) {
+    /* Re-enable after resume, and after a *failed* suspend too: a failed
+     * suspend leaves suspended==false with the IRQ masked, and a pad awake
+     * but IRQ-deaf stays dead until the next full cycle. */
+    if ((!suspend || ret != 0) && config->rdy_gpio.port != NULL) {
         int gpio_ret = gpio_pin_interrupt_configure_dt(&config->rdy_gpio, GPIO_INT_EDGE_TO_ACTIVE);
         if (gpio_ret == 0) {
             LOG_INF("RDY interrupts enabled");
@@ -320,6 +380,12 @@ done:
                 ret = gpio_ret;
             }
         }
+    }
+    if (!suspend && ret == 0 && drv_data->needs_reconfigure) {
+        /* Deferred reconfigure from a reset-during-suspend; settle time has
+         * elapsed while asleep, so re-run configuration inline under lock. */
+        drv_data->needs_reconfigure = false;
+        tps43_configure_device(dev);
     }
     tps43_end_communication_window(dev);
     if (!lock_held) {
@@ -410,9 +476,9 @@ static void tps43_drag_continuation_timeout(struct k_work *work) {
     struct tps43_drv_data *drv_data = CONTAINER_OF(dwork, struct tps43_drv_data, drag_continuation_work);
     const struct device *dev = drv_data->dev;
 
-    if (k_mutex_lock(&drv_data->lock, K_MSEC(20)) != 0) {
-        LOG_WRN("Drag continuation timeout could not take lock, rescheduling 10ms");
-        k_work_reschedule(&drv_data->drag_continuation_work, K_MSEC(10));
+    if (k_mutex_lock(&drv_data->lock, K_MSEC(100)) != 0) {
+        /* 100 ms retry avoids a 10 ms spin under sustained mutex contention. */
+        k_work_reschedule(&drv_data->drag_continuation_work, K_MSEC(100));
         return;
     }
 
@@ -421,198 +487,50 @@ static void tps43_drag_continuation_timeout(struct k_work *work) {
         drv_data->drag_continuation_active = false;
         drv_data->drag_active = false;
         drv_data->drag_button_pressed = false;
-        drv_data->force_pressed = false;
-        drv_data->force_baseline = 0;
-        drv_data->force_phase = 0;
-        drv_data->force_zero_count = 0;
         input_report_key(dev, INPUT_BTN_0, 0, true, K_FOREVER);
+        /* Timeout expiry leaves the pad idle: no later report would refresh a
+         * button state lost on the wire, so arm the release retry. */
+        k_work_reschedule(&drv_data->touch_release_work, K_MSEC(TPS43_TOUCH_RELEASE_RETRY_MS));
     }
 
     k_mutex_unlock(&drv_data->lock);
 }
 
-/**
- * @brief Force-sample poll while a finger is presumed down
- *
- * Touch strength is not an event source (datasheet 8.8.1): a stationary
- * press leaves the sensor silent, and a lost RDY frame leaves the driver
- * blind to a lift. The work handler's random-address event read is itself
- * a forced communication (datasheet 8.8.2) — the same transaction the
- * boot register dump uses — so the poll only re-submits the handler. The
- * done path re-arms it until a zero-finger frame proves the pad clear.
- */
-static void tps43_force_poll_work(struct k_work *work) {
+static void tps43_reconfigure_work_handler(struct k_work *work) {
+    struct k_work_delayable *dwork = k_work_delayable_from_work(work);
     struct tps43_drv_data *drv_data =
-        CONTAINER_OF(k_work_delayable_from_work(work), struct tps43_drv_data, force_poll_work);
+        CONTAINER_OF(dwork, struct tps43_drv_data, reconfigure_work);
+    const struct device *dev = drv_data->dev;
 
-    k_work_submit(&drv_data->work);
+    if (k_mutex_lock(&drv_data->lock, K_FOREVER) != 0) {
+        return;
+    }
+    if (!drv_data->suspended) {
+        tps43_configure_device(dev);
+        tps43_end_communication_window(dev);
+    } else {
+        /* Chip reset while suspended: a bare resume leaves it in factory
+         * defaults (no SETUP_COMPLETE -> no reports). Latch; consumed by the
+         * next successful resume. */
+        drv_data->needs_reconfigure = true;
+    }
+    k_mutex_unlock(&drv_data->lock);
 }
 
-#define FORCE_GRACE_MS 250
-#define FORCE_FLOOR_LEAK 4
-#define FORCE_PROBE_MAX_FAILURES 250
-
-/**
- * @brief Processes single-finger force touch pressure and updates button state
- *
- * Baseline model (integer-only, self-healing):
- * - 250 ms grace per touchdown: baseline tracks raw strength 1:1, absorbing
- *   the landing/contact-flattening ramp deterministically; no press can
- *   actuate until the contact settles (Apple-like)
- * - Armed: baseline drops instantly to any lower sample and leaks up toward
- *   the current sample at FORCE_FLOOR_LEAK counts per sampled frame, so a
- *   bad seed or a lighter rest re-syncs the floor without an EMA; a
- *   deliberate push outpaces the leak and survives as delta
- * - Two-frame confirmation: a single-sample spike never actuates
- * - Baseline frozen during a press: deterministic release threshold,
- *   bounded hysteresis, 2-frame zero debounce
- *
- * @param dev Pointer to trackpad device
- * @param num_fingers Current number of detected touch contacts
- * @param touch_strength 16-bit raw touch strength value from sensor
- * @param is_drag_active Pointer to is_drag_active flag in work handler
- */
-static void tps43_process_force_touch(const struct device *dev,
-                                      uint8_t num_fingers,
-                                      uint16_t touch_strength,
-                                      bool *is_drag_active) {
-    const struct tps43_config *config = dev->config;
-    struct tps43_drv_data *drv_data = dev->data;
-
-    if (!config->force_touch) {
-        return;
+/* Gesture angle props encode as 64*tan(deg) into an 8-bit register. Table at
+ * 5-degree granularity (truncated, matching the old float cast exactly) avoids
+ * pulling libm into the image; entries above 75 deg would overflow u8 anyway. */
+static uint8_t tps43_tan64(int16_t degrees) {
+    static const uint8_t lut[] = {0, 5, 11, 17, 23, 29, 36, 44, 53, 64,
+                                  76, 91, 110, 137, 175, 238};
+    if (degrees < 0) {
+        return 0;
     }
-
-    /* Force touch is strictly single-finger only.
-     * Multi-finger touches (>1) cancel force press immediately and reset baseline state.
-     * Zero-finger (lift) is deferred to the finger-lift & edge continuation handler.
-     */
-    if (num_fingers > 1) {
-        if (drv_data->force_pressed) {
-            LOG_DBG("Force touch released due to multi-finger count: %u", num_fingers);
-            drv_data->force_pressed = false;
-            if (!(*is_drag_active) && !drv_data->drag_continuation_active) {
-                input_report_key(dev, INPUT_BTN_0, 0, true, K_FOREVER);
-            }
-        }
-        drv_data->force_phase = 0;
-        drv_data->force_press_confirm = 0;
-        drv_data->force_zero_count = 0;
-        drv_data->force_baseline = 0;
-        return;
+    size_t idx = ((size_t)degrees) / 5;
+    if (idx >= ARRAY_SIZE(lut)) {
+        return UINT8_MAX;
     }
-
-    if (num_fingers == 0) {
-        drv_data->force_phase = 0;
-        drv_data->force_press_confirm = 0;
-        drv_data->force_zero_count = 0;
-        return;
-    }
-
-    /* Frames that skipped the strength read (motion, unpressed) carry no
-     * sample: a zero here must not track the baseline down or seed it.
-     * While pressed, zero still flows through: the zero-debounce below is
-     * the release path for a persistently unreadable strength register.
-     */
-    if (touch_strength == 0 && !drv_data->force_pressed) {
-        return;
-    }
-
-    if (drv_data->force_phase == 0) {
-        drv_data->force_touchdown_ms = k_uptime_get();
-        drv_data->force_baseline = touch_strength;
-        drv_data->force_phase = 1;
-        return;
-    }
-
-    if (drv_data->force_phase == 1) {
-        /* Grace: 1:1 tracking absorbs the flattening ramp; uptime-based so
-         * the variable frame rate cannot shorten it.
-         */
-        if (k_uptime_get() - drv_data->force_touchdown_ms < FORCE_GRACE_MS) {
-            drv_data->force_baseline = touch_strength;
-            return;
-        }
-        drv_data->force_phase = 2;
-        return;
-    }
-
-    if (!drv_data->force_pressed) {
-        /* Floor: instant drop to a softer contact, rate-limited leak up. */
-        if (touch_strength < drv_data->force_baseline) {
-            drv_data->force_baseline = touch_strength;
-        } else {
-            uint16_t leak_ceiling =
-                (drv_data->force_baseline > UINT16_MAX - FORCE_FLOOR_LEAK)
-                    ? UINT16_MAX
-                    : drv_data->force_baseline + FORCE_FLOOR_LEAK;
-            drv_data->force_baseline =
-                (touch_strength < leak_ceiling) ? touch_strength : leak_ceiling;
-        }
-
-        uint16_t delta = touch_strength - drv_data->force_baseline;
-        if (delta >= config->force_touch_delta) {
-            /* Two-frame confirmation rejects single-sample spikes */
-            drv_data->force_press_confirm++;
-            if (drv_data->force_press_confirm >= 2) {
-                drv_data->force_pressed = true;
-                drv_data->force_press_confirm = 0;
-                drv_data->force_peak_strength = touch_strength;
-                drv_data->force_zero_count = 0;
-                LOG_DBG("Force Press: Raw=%u, Base=%u, Delta=%u (Thresh=%u)",
-                        touch_strength, drv_data->force_baseline, delta,
-                        config->force_touch_delta);
-                if (!(*is_drag_active) && !drv_data->drag_continuation_active) {
-                    input_report_key(dev, INPUT_BTN_0, 1, true, K_FOREVER);
-                }
-            }
-        } else {
-            drv_data->force_press_confirm = 0;
-        }
-    } else {
-        /* Track peak force */
-        if (touch_strength > drv_data->force_peak_strength) {
-            drv_data->force_peak_strength = touch_strength;
-        }
-
-        /* Check for force release with bounded dynamic hysteresis and underflow protection */
-        int32_t raw_eff_delta = (int32_t)config->force_touch_delta - (int32_t)config->force_touch_hysteresis;
-        int32_t min_eff_delta = (int32_t)config->force_touch_delta >> 2;       /* Floor: At least 25% above baseline */
-        int32_t max_eff_delta = ((int32_t)config->force_touch_delta * 3) >> 2; /* Ceiling: At most 75% above baseline */
-
-        if (min_eff_delta < 1) {
-            min_eff_delta = 1;
-        }
-        if (max_eff_delta < min_eff_delta) {
-            max_eff_delta = min_eff_delta;
-        }
-
-        int32_t eff_delta = CLAMP(raw_eff_delta, min_eff_delta, max_eff_delta);
-        uint32_t release_thresh_calc = (uint32_t)drv_data->force_baseline + (uint32_t)eff_delta;
-        uint16_t release_thresh = (release_thresh_calc > UINT16_MAX) ? UINT16_MAX : (uint16_t)release_thresh_calc;
-
-        /* Zero-strength debounce (require 2 consecutive zero frames to avoid releasing on 1-frame glitches) */
-        if (touch_strength == 0) {
-            drv_data->force_zero_count++;
-        } else {
-            drv_data->force_zero_count = 0;
-        }
-
-        bool force_zero_release = (drv_data->force_zero_count >= 2);
-        bool force_threshold_release = (touch_strength > 0 && touch_strength < release_thresh);
-
-        if (force_zero_release || force_threshold_release) {
-            drv_data->force_pressed = false;
-            drv_data->force_press_confirm = 0;
-            drv_data->force_zero_count = 0;
-            LOG_DBG("Force Release: Raw=%u, Base=%u, Peak=%u (ReleaseThresh=%u)",
-                    touch_strength, drv_data->force_baseline,
-                    drv_data->force_peak_strength, release_thresh);
-            if (!(*is_drag_active) && !drv_data->drag_continuation_active) {
-                input_report_key(dev, INPUT_BTN_0, 0, true, K_FOREVER);
-            }
-        }
-    }
+    return lut[idx];
 }
 
 /**
@@ -637,10 +555,23 @@ static void tps43_work_handler(struct k_work *work) {
     bool is_drag_active = drv_data->drag_active;
     int ret;
 
-    // If device is not initialized or in suspend, ignore interrupt (RDY should be disabled)
-    if (!drv_data->initialized || drv_data->suspended) {
-        LOG_WRN("RDY interrupt while uninitialized or in suspend mode - ignoring");
+    // If device is not initialized, ignore interrupt (RDY should be disabled)
+    if (!drv_data->initialized) {
+        LOG_WRN("RDY interrupt while uninitialized - ignoring");
         return;
+    }
+
+    if (drv_data->suspended) {
+        LOG_INF("RDY interrupt while suspended - resuming device");
+        /* Full wake dance (NACK read, clear SUSPEND, re-arm RDY); a bare flag
+         * flip leaves the chip asleep so the first burst read NACKs. */
+        if (tps43_set_suspend_internal(dev, false, false) != 0) {
+            /* Retry the wake dance now instead of betting the chip re-asserts
+             * RDY for the discarded event; a repeat on persistent failure is
+             * bounded by the NACK/teardown path below. */
+            LOG_WRN("Resume failed, re-queueing handler");
+            k_work_submit(&drv_data->work);
+        }
     }
 
     // Acquire mutex to protect all I2C and state operations from interruption
@@ -649,12 +580,8 @@ static void tps43_work_handler(struct k_work *work) {
 
     /*
      * Read the event block in a single I2C transaction: up through ABS_Y
-     * (13 bytes) when drag continuation or force touch is enabled, otherwise
-     * 9 bytes up through REL_Y. TOUCH_STRENGTH is fetched with a separate
-     * random read in the same window — the module firmware has only ever been
-     * observed to stream the event block reliably through ABS_Y, and the
-     * single-register random read is the transaction the boot register dump
-     * already proves works on this hardware.
+     * (13 bytes) when drag continuation is enabled, otherwise 9 bytes up
+     * through REL_Y.
      * Byte offsets into the buffer:
      *   [0] GESTURE_EVENTS_0   (0x000D)
      *   [1] GESTURE_EVENTS_1   (0x000E)
@@ -663,104 +590,43 @@ static void tps43_work_handler(struct k_work *work) {
      *   [4] NUM_FINGERS        (0x0011)
      *   [5..6] REL_X           (0x0012, big-endian)
      *   [7..8] REL_Y           (0x0014, big-endian)
-     *   [9..10] ABS_X          (0x0016, big-endian, when drag continuation or force touch is enabled)
-     *   [11..12] ABS_Y         (0x0018, big-endian, when drag continuation or force touch is enabled)
+     *   [9..10] ABS_X          (0x0016, big-endian, when drag continuation is enabled)
+     *   [11..12] ABS_Y         (0x0018, big-endian, when drag continuation is enabled)
      */
-    size_t read_len;
-    if (config->force_touch || config->drag_continuation) {
-        read_len = (TPS43_REG_ABS_Y + 2) - TPS43_REG_GESTURE_EVENTS_0; /* 13 bytes */
-    } else {
-        read_len = (TPS43_REG_REL_Y + 2) - TPS43_REG_GESTURE_EVENTS_0; /* 9 bytes */
-    }
+    size_t read_len = config->drag_continuation ?
+                      ((TPS43_REG_ABS_Y + 2) - TPS43_REG_GESTURE_EVENTS_0) :
+                      ((TPS43_REG_REL_Y + 2) - TPS43_REG_GESTURE_EVENTS_0);
 
     uint8_t touch_data[13];
     ret = read_sequence_registers(dev, TPS43_REG_GESTURE_EVENTS_0, touch_data, read_len);
-    if (ret < 0 && config->force_touch) {
-        /* Poll-originated reads are forced and may NACK once while the
-         * device is mid-cycle; one retry protects an active press or drag
-         * from a spurious error teardown.
-         */
-        ret = read_sequence_registers(dev, TPS43_REG_GESTURE_EVENTS_0, touch_data, read_len);
-    }
-
-    /* Strength is only actionable when the processor can use it: while
-     * unpressed, motion frames are trigger-gated anyway, so skip the extra
-     * transaction and let the sample read as zero (= no sample).
-     * Strength-read failure likewise degrades to 0: the zero-debounce in
-     * the force processor turns a persistently unreadable register into a
-     * release.
-     */
-    uint16_t strength_raw = 0;
-    bool frame_motion = touch_data[5] || touch_data[6] || touch_data[7] || touch_data[8];
-    if (ret == 0 && config->force_touch && touch_data[4] >= 1 &&
-        (drv_data->force_pressed || !frame_motion)) {
-        uint8_t strength_buf[2];
-        if (read_sequence_registers(dev, TPS43_REG_TOUCH_STRENGTH, strength_buf, 2) == 0) {
-            strength_raw = (uint16_t)((strength_buf[0] << 8) | strength_buf[1]);
-        }
-    }
     /* Immediately free the trackpad so it begins the next capacitive sample cycle */
     tps43_end_communication_window(dev);
 
     if (ret < 0) {
-        LOG_ERR("Touch data read error: %d", ret);
-        if (drv_data->touching) {
-            drv_data->touching = false;
-            input_report_key(dev, INPUT_BTN_TOUCH, 0, true, K_FOREVER);
+        if (drv_data->i2c_err_count++ == 0) {
+            LOG_WRN("Touch data read error: %d", ret);
+        } else {
+            LOG_ERR("Touch data read error (x%u): %d", drv_data->i2c_err_count, ret);
         }
-        if (drv_data->drag_button_pressed || is_drag_active || drv_data->drag_continuation_active || drv_data->force_pressed) {
-            k_work_cancel_delayable(&drv_data->drag_continuation_work);
-            drv_data->drag_continuation_active = false;
-            drv_data->drag_button_pressed = false;
-            drv_data->force_pressed = false;
-            is_drag_active = false;
-            input_report_key(dev, INPUT_BTN_0, 0, true, K_FOREVER);
-        }
-        drv_data->touch_session_fingers = 0;
-        drv_data->prev_num_fingers = 0;
-        drv_data->force_phase = 0;
-        drv_data->force_press_confirm = 0;
-        drv_data->force_zero_count = 0;
-        drv_data->force_baseline = 0;
-        drv_data->force_peak_strength = 0;
-        /* probe_fingers untouched: the finger is still presumed down,
-         * the done-path poll keeps probing until the device answers.
-         */
-        drv_data->probe_failures++;
+        tps43_teardown_session(drv_data);
+        is_drag_active = false;
         goto done;
     }
+    drv_data->i2c_err_count = 0;
 
     /* Runtime reset detection and recovery */
     if (unlikely(touch_data[2] & TPS43_SHOW_RESET)) {
         /* AUTO_ATI is a persistent enable: always re-assert it, clearing it
-         * disables tuning until the next full init. Keep ACK + reconfigure in
-         * one window: the device stays in its setup window until closed.
+         * disables tuning until the next full init.
          */
-        LOG_WRN("Runtime reset detected on trackpad, reconfiguring...");
+        LOG_WRN("Runtime reset detected on trackpad (fingers=%u), reconfiguring...", touch_data[4]);
         tps43_i2c_write_reg8(dev, TPS43_REG_SYSTEM_CONTROL_0, TPS43_ACK_RESET | TPS43_AUTO_ATI);
-        tps43_configure_device(dev);
         tps43_end_communication_window(dev);
-
-        if (drv_data->touching) {
-            drv_data->touching = false;
-            input_report_key(dev, INPUT_BTN_TOUCH, 0, true, K_FOREVER);
-        }
-        if (drv_data->drag_button_pressed || is_drag_active || drv_data->drag_continuation_active || drv_data->force_pressed) {
-            k_work_cancel_delayable(&drv_data->drag_continuation_work);
-            drv_data->drag_continuation_active = false;
-            drv_data->drag_button_pressed = false;
-            drv_data->force_pressed = false;
-            is_drag_active = false;
-            input_report_key(dev, INPUT_BTN_0, 0, true, K_FOREVER);
-        }
-        drv_data->touch_session_fingers = 0;
-        drv_data->prev_num_fingers = 0;
-        drv_data->force_phase = 0;
-        drv_data->force_press_confirm = 0;
-        drv_data->force_zero_count = 0;
-        drv_data->force_baseline = 0;
-        drv_data->force_peak_strength = 0;
-        drv_data->probe_fingers = 0;
+        /* Deferred so the AUTO_ATI settle does not hold the mutex across a sleep. */
+        k_work_reschedule(&drv_data->reconfigure_work,
+                          K_MSEC(touch_data[4] == 0 ? 50 : 0));
+        tps43_teardown_session(drv_data);
+        is_drag_active = false;
         goto done;
     }
 
@@ -769,18 +635,11 @@ static void tps43_work_handler(struct k_work *work) {
     int16_t rel_x = (int16_t)((touch_data[5] << 8) | touch_data[6]);
     int16_t rel_y = (int16_t)((touch_data[7] << 8) | touch_data[8]);
 
-    /* Finger count confirmed by the device: authoritative for the
-     * self-heal probe; a zero here proves the lift and stops the poll.
-     */
-    drv_data->probe_fingers = num_fingers;
-    drv_data->probe_failures = 0;
 
-    if ((config->drag_continuation || config->force_touch) && num_fingers >= 1) {
+    if (config->drag_continuation && num_fingers >= 1) {
         drv_data->last_abs_x = (uint16_t)((touch_data[9] << 8) | touch_data[10]);
         drv_data->last_abs_y = (uint16_t)((touch_data[11] << 8) | touch_data[12]);
     }
-
-    uint16_t touch_strength = strength_raw;
 
     /* In-loop self-healing and continuation resumption */
     if (drv_data->drag_continuation_active) {
@@ -794,14 +653,13 @@ static void tps43_work_handler(struct k_work *work) {
             LOG_DBG("Continuation aborted by finger count (%d) -> Releasing button", num_fingers);
             drv_data->drag_continuation_active = false;
             drv_data->drag_active = false;
-            drv_data->force_pressed = false;
             is_drag_active = false;
             if (drv_data->drag_button_pressed) {
                 drv_data->drag_button_pressed = false;
                 input_report_key(dev, INPUT_BTN_0, 0, true, K_FOREVER);
             }
         }
-    } else if (drv_data->drag_button_pressed && !is_drag_active && !drv_data->force_pressed) {
+    } else if (drv_data->drag_button_pressed && !is_drag_active) {
         LOG_WRN("Orphaned drag button state detected -> Force clearing INPUT_BTN_0");
         drv_data->drag_button_pressed = false;
         input_report_key(dev, INPUT_BTN_0, 0, true, K_FOREVER);
@@ -809,9 +667,13 @@ static void tps43_work_handler(struct k_work *work) {
 
     bool is_touching = (num_fingers > 0);
     if (is_touching != drv_data->touching) {
-        drv_data->touching = is_touching;
         LOG_DBG("Touch state changed: %s", is_touching ? "down" : "up");
-        input_report_key(dev, INPUT_BTN_TOUCH, is_touching ? 1 : 0, true, K_FOREVER);
+        if (is_touching) {
+            drv_data->touching = true;
+            input_report_key(dev, INPUT_BTN_TOUCH, 1, true, K_FOREVER);
+        } else {
+            tps43_release_touch(dev);
+        }
     }
 
     /* Track peak finger count for the current touch session */
@@ -843,7 +705,7 @@ static void tps43_work_handler(struct k_work *work) {
                 input_report_key(dev, INPUT_BTN_1, 0, true, K_FOREVER);
             }
         }
-        if ((gestures_events[0] & TPS43_PRESS_AND_HOLD) && !is_drag_active && !drv_data->force_pressed) {
+        if ((gestures_events[0] & TPS43_PRESS_AND_HOLD) && !is_drag_active) {
             LOG_DBG("Press and hold detected - DRAG (HOLD LEFT BUTTON)");
             // set internal drag flag and press left mouse button
             is_drag_active = true;
@@ -859,12 +721,9 @@ static void tps43_work_handler(struct k_work *work) {
         }
     }
 
-    /* Process dynamic force touch */
-    tps43_process_force_touch(dev, num_fingers, touch_strength, &is_drag_active);
-
     /* Release drag lock when contact is lost */
     if (drv_data->prev_num_fingers > 0 && num_fingers == 0) {
-        if (config->drag_continuation && (is_drag_active || drv_data->force_pressed) &&
+        if (config->drag_continuation && is_drag_active &&
             tps43_is_near_edge(config, drv_data->last_abs_x, drv_data->last_abs_y)) {
 
             LOG_DBG("Edge lift detected -> Arming drag continuation (%d ms)",
@@ -872,22 +731,19 @@ static void tps43_work_handler(struct k_work *work) {
             drv_data->drag_continuation_active = true;
             k_work_reschedule(&drv_data->drag_continuation_work,
                               K_MSEC(config->drag_continuation_timeout_ms));
-            /* Clear force_pressed so button state is transferred to continuation */
-            drv_data->force_pressed = false;
             /* Keep is_drag_active intact and do not emit button release */
         } else {
-            if (is_drag_active || drv_data->force_pressed) {
+            if (is_drag_active) {
                 LOG_DBG("Drag contact lost -> RELEASE LEFT BUTTON");
                 is_drag_active = false;
-                drv_data->force_pressed = false;
                 drv_data->drag_button_pressed = false;
                 input_report_key(dev, INPUT_BTN_0, 0, true, K_FOREVER);
             }
         }
     }
 
-    /* Track drag_button_pressed state when any drag or force mode is active */
-    if (is_drag_active || drv_data->drag_continuation_active || drv_data->force_pressed) {
+    /* Track drag_button_pressed state when any drag mode is active */
+    if (is_drag_active || drv_data->drag_continuation_active) {
         drv_data->drag_button_pressed = true;
     } else {
         drv_data->drag_button_pressed = false;
@@ -899,7 +755,7 @@ static void tps43_work_handler(struct k_work *work) {
             tps43_handle_swipe(dev, num_fingers, rel_x, rel_y);
         } else if (is_scroll_active) {
             // Scroll processing: keep only dominant axis
-            if (abs(rel_x) > abs(rel_y)) {
+            if ((rel_x < 0 ? -rel_x : rel_x) > (rel_y < 0 ? -rel_y : rel_y)) {
                 // Horizontal scroll
                 if (config->invert_scroll_x) {
                     rel_x = -rel_x;
@@ -952,10 +808,6 @@ static void tps43_work_handler(struct k_work *work) {
 
     if (num_fingers == 0) {
         drv_data->touch_session_fingers = 0;
-        if (!drv_data->drag_continuation_active) {
-            drv_data->force_baseline = 0;
-            drv_data->force_peak_strength = 0;
-        }
     }
 
     drv_data->prev_num_fingers = num_fingers;
@@ -963,21 +815,6 @@ static void tps43_work_handler(struct k_work *work) {
 done:
     // Save for next call
     drv_data->drag_active = is_drag_active;
-
-    /* Self-heal: while a finger is presumed down, RDY is not guaranteed
-     * (lost lift frame, event-silent wedge), so keep probing at the force
-     * sample rate until a zero-finger frame clears the presumption.
-     */
-    if (config->force_touch && drv_data->probe_fingers >= 1) {
-        if (drv_data->probe_failures >= FORCE_PROBE_MAX_FAILURES) {
-            drv_data->probe_fingers = 0;
-            LOG_WRN("Force probe abandoned: device unresponsive");
-        } else {
-            k_work_reschedule(&drv_data->force_poll_work, K_MSEC(40));
-        }
-    } else {
-        k_work_cancel_delayable(&drv_data->force_poll_work);
-    }
 
     // Release mutex after completing event handling
     k_mutex_unlock(&drv_data->lock);
@@ -996,7 +833,6 @@ static int tps43_reset_values(const struct device *dev) {
     struct tps43_drv_data *drv_data = dev->data;
 
     k_work_cancel_delayable(&drv_data->drag_continuation_work);
-    k_work_cancel_delayable(&drv_data->force_poll_work);
     drv_data->drag_continuation_active = false;
 
     if (drv_data->touching) {
@@ -1004,13 +840,11 @@ static int tps43_reset_values(const struct device *dev) {
         input_report_key(dev, INPUT_BTN_TOUCH, 0, true, K_FOREVER);
     }
 
-    if (drv_data->drag_button_pressed || drv_data->drag_active || drv_data->force_pressed) {
+    if (drv_data->drag_button_pressed || drv_data->drag_active) {
         drv_data->drag_button_pressed = false;
-        drv_data->force_pressed = false;
         input_report_key(dev, INPUT_BTN_0, 0, true, K_FOREVER);
     }
 
-    drv_data->device_ready = false;
     drv_data->initialized = false;
     drv_data->drag_active = false;
     drv_data->touching = false;
@@ -1018,15 +852,6 @@ static int tps43_reset_values(const struct device *dev) {
     drv_data->prev_num_fingers = 0;
     drv_data->last_abs_x = 0;
     drv_data->last_abs_y = 0;
-    drv_data->force_baseline = 0;
-    drv_data->force_peak_strength = 0;
-    drv_data->force_phase = 0;
-    drv_data->force_touchdown_ms = 0;
-    drv_data->force_press_confirm = 0;
-    drv_data->force_zero_count = 0;
-    drv_data->force_pressed = false;
-    drv_data->probe_fingers = 0;
-    drv_data->probe_failures = 0;
 
     LOG_INF("Values reset");
     return 0;
@@ -1192,8 +1017,7 @@ static int tps43_configure_device(const struct device *dev) {
     }
 
     if (config->swipe_angle != -1) {
-        double angle_rad = config->swipe_angle * 3.141592653589793 / 180.0;
-        uint8_t reg_val = (uint8_t)(64.0 * tan(angle_rad));
+        uint8_t reg_val = tps43_tan64(config->swipe_angle);
         ret = tps43_i2c_write_reg8(dev, TPS43_REG_SWIPE_ANGLE, reg_val);
         if (ret != 0) {
             LOG_WRN("Swipe angle write error: %d", ret);
@@ -1234,8 +1058,7 @@ static int tps43_configure_device(const struct device *dev) {
     }
 
     if (config->scroll_angle != -1) {
-        double angle_rad = config->scroll_angle * 3.141592653589793 / 180.0;
-        uint8_t reg_val = (uint8_t)(64.0 * tan(angle_rad));
+        uint8_t reg_val = tps43_tan64(config->scroll_angle);
         ret = tps43_i2c_write_reg8(dev, TPS43_REG_SCROLL_ANGLE, reg_val);
         if (ret != 0) {
             LOG_WRN("Scroll angle write error: %d", ret);
@@ -1519,8 +1342,6 @@ static int check_reset_and_reconfigure(const struct device *dev) {
         LOG_ERR("Device configuration error: %d", ret);
         return ret;
     }
-
-    drv_data->device_ready = true;
 
     return 0;
 }
@@ -1840,7 +1661,8 @@ static int tps43_init(const struct device *dev) {
     k_mutex_init(&drv_data->lock);
     k_work_init(&drv_data->work, tps43_work_handler);
     k_work_init_delayable(&drv_data->drag_continuation_work, tps43_drag_continuation_timeout);
-    k_work_init_delayable(&drv_data->force_poll_work, tps43_force_poll_work);
+    k_work_init_delayable(&drv_data->touch_release_work, tps43_touch_release_retry);
+    k_work_init_delayable(&drv_data->reconfigure_work, tps43_reconfigure_work_handler);
 
     ret = tps43_reset_values(dev);
     if (ret != 0) {
@@ -1916,7 +1738,6 @@ static int tps43_init(const struct device *dev) {
 
 #define TPS43_INIT(inst)                                                                             \
     static struct tps43_drv_data tps43_##inst##_drvdata = {                                          \
-        .device_ready = false,                                                                       \
         .initialized = false,                                                                        \
         .drag_active = false,                                                                        \
         .drag_continuation_active = false,                                                           \
@@ -1927,15 +1748,6 @@ static int tps43_init(const struct device *dev) {
         .touching = false,                                                                           \
         .touch_session_fingers = 0,                                                                  \
         .prev_num_fingers = 0,                                                                       \
-        .force_baseline = 0,                                                                         \
-        .force_peak_strength = 0,                                                                    \
-        .force_phase = 0,                                                                            \
-        .force_touchdown_ms = 0,                                                                     \
-        .force_press_confirm = 0,                                                                    \
-        .force_zero_count = 0,                                                                       \
-        .force_pressed = false,                                                                      \
-        .probe_fingers = 0,                                                                          \
-        .probe_failures = 0,                                                                         \
     };                                                                                               \
                                                                                                      \
     static const struct tps43_config tps43_##inst##_config = {                                       \
@@ -1946,9 +1758,6 @@ static int tps43_init(const struct device *dev) {
         .drag_continuation = DT_INST_PROP_OR(inst, drag_continuation, false),                         \
         .drag_continuation_timeout_ms = DT_INST_PROP_OR(inst, drag_continuation_timeout_ms, 600),    \
         .drag_continuation_edge_buffer = DT_INST_PROP_OR(inst, drag_continuation_edge_buffer, 80),   \
-        .force_touch = DT_INST_PROP_OR(inst, force_touch, false),                                     \
-        .force_touch_delta = DT_INST_PROP_OR(inst, force_touch_pressure_delta, 300),                 \
-        .force_touch_hysteresis = DT_INST_PROP_OR(inst, force_touch_hysteresis, 120),                \
         .press_and_hold = DT_INST_PROP(inst, press_and_hold),                                        \
         .two_finger_tap = DT_INST_PROP(inst, two_finger_tap),                                        \
         .three_finger_tap = DT_INST_PROP(inst, three_finger_tap),                                    \

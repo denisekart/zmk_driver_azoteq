@@ -206,9 +206,6 @@ struct tps43_config {
     bool drag_continuation;
     int16_t drag_continuation_timeout_ms;
     int16_t drag_continuation_edge_buffer;
-    bool force_touch;
-    int16_t force_touch_delta;
-    int16_t force_touch_hysteresis;
     bool press_and_hold;
     bool two_finger_tap;
     bool three_finger_tap;
@@ -273,29 +270,11 @@ struct tps43_drv_data {
     struct gpio_callback rdy_cb;
     struct k_work work;
     struct k_work_delayable drag_continuation_work;
-    struct k_work_delayable force_poll_work;
+    struct k_work_delayable touch_release_work;
+    struct k_work_delayable reconfigure_work;
 
-    bool device_ready;
-    bool initialized;
-    bool drag_active;
-    bool drag_continuation_active;
-    bool drag_button_pressed;
-    uint16_t last_abs_x;
-    uint16_t last_abs_y;
-    bool suspended;
-    bool touching;
-    int64_t last_three_finger_swipe_ms;
-    uint8_t touch_session_fingers;
-    uint8_t prev_num_fingers;
-    uint16_t force_baseline;
-    uint16_t force_peak_strength;
-    uint8_t force_phase; /* 0 unseeded, 1 touchdown grace, 2 armed */
-    int64_t force_touchdown_ms;
-    uint8_t force_press_confirm;
-    uint8_t force_zero_count;
-    bool force_pressed;
-    uint8_t probe_fingers; /* last confirmed finger count; drives self-heal poll */
-    uint16_t probe_failures;
+    bool needs_reconfigure; /* latch: chip reset landed while suspended */
+    uint8_t i2c_err_count;  /* consecutive burst-read failures, for log throttle */
 };
 
 int tps43_set_sleep(const struct device *dev, bool sleep);
