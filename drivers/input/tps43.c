@@ -555,7 +555,9 @@ static void tps43_slide_work_handler(struct k_work *work) {
     int16_t max_x = (config->x_resolution > 0) ? config->x_resolution : 1024;
     int16_t max_y = (config->y_resolution > 0) ? config->y_resolution : 1024;
     if (config->switch_xy) {
-        swap(max_x, max_y);
+        int16_t tmp = max_x;
+        max_x = max_y;
+        max_y = tmp;
     }
     int32_t dx = (int32_t)drv_data->last_abs_x - max_x / 2;
     int32_t dy = (int32_t)drv_data->last_abs_y - max_y / 2;
@@ -761,10 +763,9 @@ static void tps43_work_handler(struct k_work *work) {
      * during an edge drag, the ABS delta is the literal "finger didn't
      * move". */
     if (drv_data->slide_enabled) {
-        int32_t move = abs32((int32_t)drv_data->last_abs_x -
-                             (int32_t)drv_data->slide_prev_abs_x) +
-                       abs32((int32_t)drv_data->last_abs_y -
-                             (int32_t)drv_data->slide_prev_abs_y);
+        int32_t sdx = (int32_t)drv_data->last_abs_x - (int32_t)drv_data->slide_prev_abs_x;
+        int32_t sdy = (int32_t)drv_data->last_abs_y - (int32_t)drv_data->slide_prev_abs_y;
+        int32_t move = (sdx < 0 ? -sdx : sdx) + (sdy < 0 ? -sdy : sdy);
         drv_data->slide_prev_abs_x = drv_data->last_abs_x;
         drv_data->slide_prev_abs_y = drv_data->last_abs_y;
         bool slide_keep = is_drag_active && num_fingers == 1 &&
