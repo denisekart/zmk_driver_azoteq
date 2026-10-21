@@ -277,6 +277,7 @@ struct tps43_drv_data {
     struct k_work_delayable slide_work;
     struct k_work_delayable touch_release_work;
     struct k_work_delayable reconfigure_work;
+    struct k_work_delayable reset_work;
 
     bool initialized;
     bool drag_active;
@@ -300,6 +301,18 @@ struct tps43_drv_data {
 };
 
 int tps43_set_sleep(const struct device *dev, bool sleep);
+
+/**
+ * @brief Schedule an asynchronous full re-initialization of the trackpad
+ *
+ * Queues reset_work on the system workqueue: hardware RST pulse, register
+ * re-configuration and RDY IRQ re-arm, run under the driver mutex. Returns
+ * immediately; the chip is usable again ~620 ms later.
+ *
+ * @param dev Pointer to trackpad device
+ * @return 0 when scheduled, -ENODEV if the driver never finished init
+ */
+int tps43_schedule_reset(const struct device *dev);
 
 #ifdef __cplusplus
 }

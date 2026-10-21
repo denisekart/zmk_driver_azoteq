@@ -8,3 +8,17 @@ config INPUT_TPS43
       Enable driver for Azoteq touchpad input device over I2C interface.
       Supports multitouch gestures, scrolling, clicks and power management.
 
+DT_COMPAT_ZMK_BEHAVIOR_TPS43_SOFT_RESET := zmk,behavior-tps43-soft-reset
+
+config INPUT_TPS43_SOFT_RESET
+    bool "TPS43 global input-state soft reset behavior"
+    default $(dt_compat_enabled,$(DT_COMPAT_ZMK_BEHAVIOR_TPS43_SOFT_RESET))
+    help
+      Enable the zmk,behavior-tps43-soft-reset behavior: one keymap binding
+      releases stuck keymap positions, flushes HID reports and cancels the
+      leader-key sequence on the central, stops the mouse mover and resets
+      layers to default, and re-initializes the TPS43 chip on the half that
+      owns it. Must build on BOTH split roles (the global-locality binding
+      needs a local handler wherever the behavior node is enabled), so it
+      deliberately does not depend on INPUT_TPS43.
+

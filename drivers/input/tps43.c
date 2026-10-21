@@ -16,6 +16,7 @@
 LOG_MODULE_REGISTER(tps43, CONFIG_INPUT_LOG_LEVEL);
 
 static int tps43_configure_device(const struct device *dev);
+static int tps43_full_reinit(const struct device *dev);
 
 /**
  * @brief Ends communication window with trackpad
@@ -629,6 +630,24 @@ static void tps43_reconfigure_work_handler(struct k_work *work) {
          * next successful resume. */
         drv_data->needs_reconfigure = true;
     }
+    k_mutex_unlock(&drv_data->lock);
+}
+
+static void tps43_reset_work_handler(struct k_work *work) {
+    struct k_work_delayable *dwork = k_work_delayable_from_work(work);
+    struct tps43_drv_data *drv_data =
+        CONTAINER_OF(dwork, struct tps43_drv_data, reset_work);
+    const struct device *dev = drv_data->dev;
+
+    if (k_mutex_lock(&drv_data->lock, K_FOREVER) != 0) {
+        return;
+    }
+    LOG_INF("Soft reset requested - re-initializing trackpad");
+    int ret = tps43_full_reinit(dev);
+    if (ret != 0) {
+        LOG_ERR("Soft reset failed: %d", ret);
+    }
+    tps43_end_communication_window(dev);
     k_mutex_unlock(&drv_data->lock);
 }
 
@@ -1496,6 +1515,102 @@ static int check_reset_and_reconfigure(const struct device *dev) {
 }
 
 /**
+ * @brief Full chip and driver-state re-initialization
+ *
+ * Shared core of the boot path (tps43_init) and the manual soft reset
+ * (reset_work): clears driver state and stuck buttons, verifies the I2C
+ * bus, pulses the hardware RST pin, re-acknowledges the chip reset and
+ * rewrites the full configuration, then re-arms the RDY interrupt.
+ * Blocking: the RST pulse sleeps ~620 ms and the readiness poll can wait
+ * up to 5 s; callers on the shared workqueue must hold the driver mutex
+ * across the whole call.
+ *
+ * @param dev Pointer to trackpad device
+ * @return 0 on success, negative error code on failure
+ */
+static int tps43_full_reinit(const struct device *dev) {
+    struct tps43_drv_data *drv_data = dev->data;
+    const struct tps43_config *config = dev->config;
+    int ret;
+
+    ret = tps43_reset_values(dev);
+    if (ret != 0) {
+        LOG_ERR("Values reset error: %d", ret);
+        return ret;
+    }
+
+    // Check I2C bus
+    if (!device_is_ready(config->i2c_bus.bus)) {
+        LOG_ERR("I2C bus not available");
+        return -ENODEV;
+    }
+
+    LOG_INF("I2C bus: %s", config->i2c_bus.bus->name);
+    LOG_INF("I2C address: 0x%02x", config->i2c_bus.addr);
+
+    // GPIO reset via hardware RST
+    if (config->rst_gpio.port) {
+        ret = gpio_pin_configure_dt(&config->rst_gpio, GPIO_OUTPUT_INACTIVE);
+        if (ret != 0) {
+            LOG_ERR("RST GPIO configuration error: %d", ret);
+            return ret;
+        }
+
+        gpio_pin_set_dt(&config->rst_gpio, 0);
+        k_sleep(K_MSEC(10));
+        gpio_pin_set_dt(&config->rst_gpio, 1);
+        k_sleep(K_MSEC(610));
+
+        LOG_INF("Hardware reset completed");
+    }
+
+    // check SHOW_RESET and configure
+    ret = check_reset_and_reconfigure(dev);
+    if (ret != 0) {
+        LOG_ERR("Device configuration error: %d", ret);
+        return ret;
+    }
+
+    drv_data->initialized = true;
+    drv_data->suspended = false;
+
+    // configure RDY interrupts only AFTER device configuration!
+    if (config->rdy_gpio.port != NULL) {
+        ret = gpio_pin_configure_dt(&config->rdy_gpio, GPIO_INPUT);
+        if (ret != 0) {
+            LOG_WRN("RDY GPIO configuration error: %d", ret);
+        } else {
+            ret = gpio_pin_interrupt_configure_dt(&config->rdy_gpio,
+                                                    GPIO_INT_EDGE_TO_ACTIVE);
+            if (ret == 0) {
+                /* Manual re-init re-enters here: the core rejects
+                 * re-adding an already-registered callback, so drop the
+                 * previous registration (no-op on the first call) before
+                 * re-adding; otherwise the pending-RDY poll below would be
+                 * skipped and the pad would look dead after a soft reset.
+                 * Init must precede remove: the shared helper asserts a
+                 * non-NULL handler, which a fresh boot has not set yet. */
+                gpio_init_callback(&drv_data->rdy_cb, tps43_rdy_callback,
+                                    BIT(config->rdy_gpio.pin));
+                (void)gpio_remove_callback(config->rdy_gpio.port,
+                                           &drv_data->rdy_cb);
+                ret = gpio_add_callback(config->rdy_gpio.port, &drv_data->rdy_cb);
+                if (ret == 0) {
+                    LOG_INF("RDY interrupt configured");
+                    if (gpio_pin_get_dt(&config->rdy_gpio) > 0) {
+                        k_work_submit(&drv_data->work);
+                    }
+                } else {
+                    LOG_WRN("RDY callback add error: %d", ret);
+                }
+            }
+        }
+    }
+
+    return 0;
+}
+
+/**
  * @brief Public function to put trackpad into suspend/resume
  *
  * @param dev Pointer to trackpad device
@@ -1813,44 +1928,7 @@ static int tps43_init(const struct device *dev) {
     k_work_init_delayable(&drv_data->touch_release_work, tps43_touch_release_retry);
     k_work_init_delayable(&drv_data->reconfigure_work, tps43_reconfigure_work_handler);
     k_work_init_delayable(&drv_data->slide_work, tps43_slide_work_handler);
-
-    ret = tps43_reset_values(dev);
-    if (ret != 0) {
-        LOG_ERR("Values reset error: %d", ret);
-        return ret;
-    }
-
-    // Check I2C bus
-    if (!device_is_ready(config->i2c_bus.bus)) {
-        LOG_ERR("I2C bus not available");
-        return -ENODEV;
-    }
-
-    LOG_INF("I2C bus: %s", config->i2c_bus.bus->name);
-    LOG_INF("I2C address: 0x%02x", config->i2c_bus.addr);
-
-    // GPIO reset via hardware RST
-    if (config->rst_gpio.port) {
-        ret = gpio_pin_configure_dt(&config->rst_gpio, GPIO_OUTPUT_INACTIVE);
-        if (ret != 0) {
-            LOG_ERR("RST GPIO configuration error: %d", ret);
-            return ret;
-        }
-
-        gpio_pin_set_dt(&config->rst_gpio, 0);
-        k_sleep(K_MSEC(10));
-        gpio_pin_set_dt(&config->rst_gpio, 1);
-        k_sleep(K_MSEC(610));
-
-        LOG_INF("Hardware reset completed");
-    }
-
-    // check SHOW_RESET and configure
-    ret = check_reset_and_reconfigure(dev);
-    if (ret != 0) {
-        LOG_ERR("Device configuration error: %d", ret);
-        return ret;
-    }
+    k_work_init_delayable(&drv_data->reset_work, tps43_reset_work_handler);
 
     drv_data->slide_enabled =
         config->drag_continuation_slide && config->drag_continuation;
@@ -1858,31 +1936,10 @@ static int tps43_init(const struct device *dev) {
         LOG_WRN("drag-continuation-slide requires drag-continuation - disabled");
     }
 
-    drv_data->initialized = true;
-    drv_data->suspended = false;
-
-    // configure RDY interrupts only AFTER device configuration!
-    if (config->rdy_gpio.port != NULL) {
-        ret = gpio_pin_configure_dt(&config->rdy_gpio, GPIO_INPUT);
-        if (ret != 0) {
-            LOG_WRN("RDY GPIO configuration error: %d", ret);
-        } else {
-            ret = gpio_pin_interrupt_configure_dt(&config->rdy_gpio,
-                                                    GPIO_INT_EDGE_TO_ACTIVE);
-            if (ret == 0) {
-                gpio_init_callback(&drv_data->rdy_cb, tps43_rdy_callback,
-                                    BIT(config->rdy_gpio.pin));
-                ret = gpio_add_callback(config->rdy_gpio.port, &drv_data->rdy_cb);
-                if (ret == 0) {
-                    LOG_INF("RDY interrupt configured");
-                    if (gpio_pin_get_dt(&config->rdy_gpio) > 0) {
-                        k_work_submit(&drv_data->work);
-                    }
-                } else {
-                    LOG_WRN("RDY callback add error: %d", ret);
-                }
-            }
-        }
+    // Hardware reset, chip re-configuration and RDY IRQ re-arm
+    ret = tps43_full_reinit(dev);
+    if (ret != 0) {
+        return ret;
     }
 
     tps43_dump_registers(dev);
@@ -1997,4 +2054,27 @@ int tps43_set_sleep(const struct device *dev, bool sleep) {
         return -EINVAL;
     }
     return tps43_set_suspend(dev, sleep);
+}
+
+/**
+ * @brief Public function to request an asynchronous full trackpad re-init
+ *
+ * Queues the reset work item (tps43_reset_work_handler); safe to call from
+ * a ZMK behavior handler. Returns without waiting for the ~620 ms chip
+ * re-initialization to run.
+ *
+ * @param dev Pointer to trackpad device
+ * @return 0 when scheduled, -ENODEV if the driver never finished init
+ */
+int tps43_schedule_reset(const struct device *dev) {
+    if (dev == NULL) {
+        return -EINVAL;
+    }
+
+    struct tps43_drv_data *drv_data = dev->data;
+    if (!drv_data->initialized) {
+        return -ENODEV;
+    }
+
+    return k_work_schedule(&drv_data->reset_work, K_NO_WAIT);
 }

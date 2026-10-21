@@ -1,0 +1,14 @@
+# Global soft-reset behavior for the Azoteq TPS43 trackpad stack
+
+description: |
+  Full input-state soft reset. One press runs on every firmware in the
+  split pair (global locality): releases all stuck keymap positions, clears
+  and sends the keyboard/consumer/mouse HID reports, cancels any pending
+  leader-key sequence. On the central it also stops the mouse mover and
+  returns the layer tree to the default layer; on the peripheral owning the
+  TPS43 it re-initializes the trackpad chip (hardware RST pulse, full
+  re-configuration, RDY IRQ re-arm). No reboot, BLE stays connected.
+
+compatible: "zmk,behavior-tps43-soft-reset"
+
+include: zero_param.yaml
