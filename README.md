@@ -1,5 +1,7 @@
 # ZMK Driver for Azoteq IQS5XX Trackpads
 
+A ZMK v0.3 input driver for Azoteq IQS5xx-based trackpads (TPS43 and TPS65 chips). It talks to the pad over I2C, driven by the pad's RDY interrupt, and turns touches into standard ZMK input events — cursor movement, clicks, drags, scrolls, swipes and zoom — so the trackpad works as a mouse on your host, including in split keyboards where the pad sits on a peripheral half.
+
 Note: This driver was originally developed by @stelmakhdigital and I wanted to add some features/bug fixes.  But I don't read Russian, so I asked my AI buddy to make this English [translated](https://github.com/geeksville/zmk_driver_azoteq/commit/4c56195658bbf31851b9892c63f758f50ea48d4d) version.  I hope you find it useful.  It now seems to work well for me.  If you see problems please open issues and I'll do what I can to help.
 
 ## Compatibility
@@ -8,28 +10,30 @@ This driver should work with any IQS5XX-based trackpad (TPS43 or TPS65).
 
 ## Features
 
-- Trackpad movement.
-- Touch reporting: finger contact is reported as `INPUT_BTN_TOUCH` (1 when one or more fingers are on the pad, 0 when all fingers are lifted).
-- Single tap: registered as left click.
-- Edge drag continuation: optional lift-and-reposition support at trackpad boundaries with configurable timeout and edge buffer.
-- Two-finger tap: registered as right click.
-- Three-finger tap: registered as middle click (INPUT_BTN_2 / INPUT_BTN_MIDDLE).
-- Press and hold: registered as continuous left click (drag).
-- Vertical and horizontal scrolling - Modern 'gesture based' two finger swiping
-- Left/right/up/down swipe send INPUT_BTN_WEST/EAST/NORTH/SOUTH events.  You can map them to other keys/actions as you wish in your dts file. (Either 3-finger or 1-finger directional swiping is supported)
-- Pinch-to-zoom (reported as movement on the INPUT_REL_MISC 'wheel' - you can add dts rules to map this to something your apps can understand)
+- **Trackpad movement** — finger motion is reported as relative cursor movement.
+- **Touch reporting** — finger contact is reported as `INPUT_BTN_TOUCH` (1 when one or more fingers are on the pad, 0 when all fingers are lifted).
+- **Single tap** — registered as left click.
+- **Two-finger tap** — registered as right click.
+- **Three-finger tap** — registered as middle click (`INPUT_BTN_2` / `INPUT_BTN_MIDDLE`). When `three-finger-tap` is not enabled, any multi-finger tap reported by the hardware falls back to two-finger-tap (right-click) behavior.
+- **Press and hold** — registered as continuous left click, i.e. drag.
+- **Two-finger scroll** — modern 'gesture based' two-finger swiping; the dominant axis wins each event so diagonal strokes don't jitter on both axes. Per-axis direction inversion via `invert-scroll-x` / `invert-scroll-y`; speed via `scroll-sensitivity`.
+- **1-finger and 3-finger directional swipes** — send `INPUT_BTN_WEST`/`EAST`/`NORTH`/`SOUTH` events; map them to any keys/actions in your `.overlay` (either or both can be enabled: `swipes` for 1-finger, `three-finger-swipe` for 3-finger only, independently of each other). Three-finger swipe actuations are throttled by `three-finger-swipe-throttle-ms` (default 300 ms, 0 disables) so one continuous motion doesn't fire repeatedly.
+- **Pinch-to-zoom** — reported as movement on the `INPUT_REL_MISC` 'wheel'; add dts rules to map this to something your apps understand.
+- **Edge drag continuation** — optional lift-and-reposition support at trackpad boundaries: during a drag, lifting a finger inside the edge buffer (`drag-continuation-edge-buffer`) keeps the button held for up to `drag-continuation-timeout-ms` so you can reposition and keep dragging.
+- **Drag-continuation auto-slide** (new) — with `drag-continuation-slide` (requires `drag-continuation`): while dragging with one finger resting nearly still inside the edge buffer, after a dwell of `drag-continuation-slide-dwell-ms` (default 250 ms) the driver injects constant-speed cursor motion away from the trackpad center. A finger counts as still when its per-report absolute movement is at most `drag-continuation-slide-still-px` (default 12). Speed is `drag-continuation-slide-speed` trackpad px/s (default 400, constant, no ramp; minimum effective value 100 px/s). Direction is the vector from pad center toward the resting finger, re-derived every tick, so moving the resting finger within the buffer steers instantly. Lifting the finger falls through to the normal lift-and-reposition continuation — the button stays held for the timeout as usual.
+- **Power management** — integrates with ZMK's activity-state system: the pad sleeps when ZMK sleeps, and also when ZMK is idle if `idle-sleep` is set. Chip-level low-power cadence knobs (`report-rate-lp1/lp2`, `timeout-*`) exist for deeper tuning; see the binding YAML.
+- **Runtime-reset self-heal** — the driver detects the chip's `SHOW_RESET` flag in the normal event loop (ESD, watchdog, brownout) and automatically re-acknowledges and re-applies its full configuration.
+- **Split-keyboard support** — via ZMK's `zmk,input-split`, the pad can live on a peripheral half while a listener on the central dispatches its events.
 
-## Usage
+## Quick start
 
-- In the configuration file (for the appropriate half), add `CONFIG_INPUT_TPS43` to enable the driver
+- In the configuration file (for the appropriate half), enable the driver:
 
 ```
 CONFIG_INPUT_TPS43=y
 ```
 
-- In the `.overlay` file, specify `compatible = "azoteq,tps43"` inside the i2c node where the trackpad will be used (example below).
-
-> For complete trackpad configuration information, see the file: [available trackpad settings](./dts/bindings/input/azoteq,tps43-common.yaml)
+- In the `.overlay` file, specify `compatible = "azoteq,tps43"` inside the i2c node where the trackpad will be used:
 
 ```
 &i2c0 {
@@ -81,18 +85,62 @@ CONFIG_INPUT_TPS43=y
         // three-finger-swipe-throttle-ms=<300>;  /* Min ms between 3-finger swipe actuations, 0 disables (optional, default 300) */
         zoom;
 
+        // drag-continuation;                        /* Keep drag alive when lifting in the edge buffer (optional) */
+        // drag-continuation-timeout-ms=<600>;       /* Lift budget for repositioning (optional, default 600) */
+        // drag-continuation-edge-buffer=<80>;       /* Edge trigger zone width in px (optional, default 80) */
+        // drag-continuation-slide;                  /* Auto-slide while a finger rests in the edge buffer during a drag (optional, requires drag-continuation) */
+        // drag-continuation-slide-dwell-ms=<250>;   /* Still-in-buffer time before sliding starts (optional, default 250) */
+        // drag-continuation-slide-still-px=<12>;    /* Per-report movement at or below which the finger counts as still (optional, default 12) */
+        // drag-continuation-slide-speed=<400>;      /* Slide speed in trackpad px/s, constant; min effective 100 (optional, default 400) */
+
         switch-xy;
         invert-scroll-y;
     };
 };
 ```
 
-- Now you need to configure a listener for tracking touches:
+## Configuration reference
 
-> Important: If your trackpad `.overlay` configuration is on the central device, use `Option 1`. If the trackpad is located on the peripheral half of the keyboard, use `Option 2`
+User-facing behavioral properties (all optional; boolean properties default to off, int properties to the listed value):
 
----
-**Option 1**
+| Property | Type | Default | Meaning |
+|---|---|---|---|
+| `single-tap` | boolean | off | Single tap = left click. |
+| `two-finger-tap` | boolean | off | Two-finger tap = right click. |
+| `three-finger-tap` | boolean | off | Three-finger tap = middle click (`INPUT_BTN_2`); without it, multi-finger taps fall back to two-finger-tap behavior. |
+| `press-and-hold` | boolean | off | Hold = continuous left click (drag). |
+| `scroll` | boolean | off | Two-finger dominant-axis scrolling. |
+| `zoom` | boolean | off | Pinch-to-zoom, emitted on `INPUT_REL_MISC`. |
+| `swipes` | boolean | off | 1-finger directional swipes → `INPUT_BTN_NORTH/SOUTH/EAST/WEST`. |
+| `three-finger-swipe` | boolean | off | 3-finger-only swipes → `INPUT_BTN_NORTH/SOUTH/EAST/WEST`; independent of `swipes`. |
+| `three-finger-swipe-throttle-ms` | int | 300 | Minimum ms between consecutive 3-finger swipe actuations; 0 disables. |
+| `drag-continuation` | boolean | off | Edge lift-and-reposition drag continuation. |
+| `drag-continuation-timeout-ms` | int | 600 | Maximum lift time (ms) allowed to reposition during an edge drag. |
+| `drag-continuation-edge-buffer` | int | 80 | Border width in trackpad px defining the edge trigger zone (~8% of the pad at 1024x1024). |
+| `drag-continuation-slide` | boolean | off | Auto-slide away from pad center while a finger rests in the edge buffer during a drag. Requires `drag-continuation`; lift falls through to normal continuation. |
+| `drag-continuation-slide-dwell-ms` | int | 250 | Still-in-buffer hold time before sliding starts; movement above the still threshold restarts it. |
+| `drag-continuation-slide-still-px` | int | 12 | Per-report absolute movement (sum of \|dx\|+\|dy\|) at or below which the finger counts as still. |
+| `drag-continuation-slide-speed` | int | 400 | Slide speed in trackpad px/s, constant, no ramp. Minimum effective value 100 px/s. |
+| `sensitivity` | int | 100 | Touch sensitivity percentage (100 = normal, higher = more sensitive). |
+| `scroll-sensitivity` | int | 100 | Scroll sensitivity percentage. |
+| `zoom-sensitivity` | int | 100 | Zoom sensitivity percentage. |
+| `switch-xy` | boolean | off | Swap X and Y axes. |
+| `invert-x` | boolean | off | Invert X coordinate values. |
+| `invert-y` | boolean | off | Invert Y coordinate values. |
+| `invert-scroll-x` | boolean | off | Invert X scroll values. |
+| `invert-scroll-y` | boolean | off | Invert Y scroll values. |
+| `enable-power-management` | boolean | on | Automatic suspend/resume power management (driver default: enabled). |
+| `idle-sleep` | boolean | off | Also sleep the trackpad while ZMK is in the IDLE activity state (by default only SLEEP sleeps it). |
+
+Register-level tuning properties (`swipe-initial-*`, `ati-*`, `report-rate-*`, `filter-*`, `timeout-*`, `tap-*`, `hold-time` and friends) keep their descriptions in the binding file: [available trackpad settings](./dts/bindings/input/azoteq,tps43-common.yaml).
+
+## Listener / split setup
+
+Now configure a listener for tracking touches:
+
+> Important: If your trackpad `.overlay` configuration is on the central device, use `Option 1`. If the trackpad is located on the peripheral half of the keyboard, use `Option 2`.
+
+**Option 1 — central listener**
 
 Simply specify the listener on the central device itself.
 
@@ -105,15 +153,9 @@ Simply specify the listener on the central device itself.
 };
 ```
 
----
+**Option 2 — peripheral trackpad via `zmk,input-split`**
 
-... Otherwise ...
-
----
-
-**Option 2**
-
-Configure `split_inputs` where the trackpad is used (on the peripheral half of the keyboard)
+Configure `split_inputs` where the trackpad is used (on the peripheral half):
 
 ```
 / {
@@ -130,7 +172,7 @@ Configure `split_inputs` where the trackpad is used (on the peripheral half of t
 };
 ```
 
-Now on the central part, you need to specify a listener but without specifying `device` (device is specified where the trackpad is used - on the peripheral part)
+On the central part, declare the matching proxy (no `device` property — the device lives on the peripheral side) plus a listener pointed at it:
 
 ```
 / {
@@ -152,8 +194,8 @@ Now on the central part, you need to specify a listener but without specifying `
     };
 };
 ```
----
 
+## Wiring
 
 > Configuring the Azoteq trackpad requires 5 pins!
 
@@ -168,89 +210,6 @@ SCL on nice!nano -> SCL on IQS5xx.
 "DR" or "RDY" pin on IQS5xx -> Any available GPIO on nice!nano. In the devicetree, this pin is specified as rdy-gpios.
 "RST" pin is used to initialize device reset. In the devicetree, this pin is specified as rst-gpios.
 
+## Maintainers note
 
-## Proper Driver Operation Sequence
-
-```txt
-1. Power on / Hardware reset
-   └─> Wait 10ms
-   └─> RST: LOW (10ms) → HIGH
-   └─> Wait ~600ms for firmware loading
-
-2. Check SHOW_RESET flag (0x000F bit 7)
-   └─> Poll until flag appears
-
-3. Acknowledge reset
-   └─> Write ACK_RESET (0x0431 = 0x80)
-
-4. Device configuration
-   └─> System Config 1 (0x058F) - event modes
-   └─> XY Config (0x0669) - axis settings
-   └─> Filter settings, gestures, etc.
-
-5. Complete setup
-   └─> Write SETUP_COMPLETE (0x058E = 0x40)
-
-6. Configure GPIO interrupt (RDY)
-   └─> AFTER full configuration
-
-```
-
-## Power Management
-
-The driver supports two independent power management mechanisms to reduce power consumption:
-
-### Integration with ZMK Power Management System
-
-The trackpad automatically enters sleep mode when the keyboard transitions to idle/sleep state.
-
-**How it works:**
-- The `tps43_idle_sleeper.c` module subscribes to ZMK `zmk_activity_state_changed` events
-- When ZMK transitions to `SLEEP` state, the trackpad enters sleep mode
-- When ZMK transitions to `IDLE` state, the trackpad enters sleep mode only if the `idle-sleep` property is set; otherwise it stays active
-- When returning to `ACTIVE` state, the trackpad wakes up
-
-**ZMK States:**
-- `ZMK_ACTIVITY_ACTIVE` - keyboard active, trackpad operational
-- `ZMK_ACTIVITY_IDLE` - keyboard in idle mode, trackpad in sleep only if `idle-sleep` is set
-- `ZMK_ACTIVITY_SLEEP` - keyboard in sleep mode, trackpad in sleep
-
-**Important:** This mechanism only works if `enable-power-management` is enabled.
-
-The optional `idle-sleep` property controls whether the IDLE state also puts the
-trackpad to sleep:
-
-```
-&i2c0 {
-    tps43_trackpad: trackpad@74 {
-        compatible = "azoteq,tps43";
-        /* ... */
-        enable-power-management;
-        idle-sleep;   /* also sleep the trackpad while ZMK is idle */
-    };
-};
-```
-
-### Technical Details
-
-**Control register:**
-- Suspend mode is controlled via the `SYSTEM_CONTROL_1` register (0x0432)
-- The `TPS43_SUSPEND` bit (BIT(0)) is set to enter suspend mode
-- In suspend mode, the trackpad consumes minimal power and does not process touches
-
-**Wake-up:**
-- Automatic wake-up occurs when activity is detected via RDY interrupt
-- On wake-up, the trackpad automatically processes the first touch
-
-> Without `enable-power-management`, power management is completely disabled
-
-## Performance & Stability Optimizations
-
-- **Mutex Synchronization**: Uses `k_mutex` with priority inheritance to prevent priority inversion with high-priority BLE and system threads.
-- **Reduced Latency**: Closes communication window (`0xEEEE`) immediately after reading I2C frame data, enabling concurrent hardware scanning and host processing.
-- **Runtime Reset Recovery**: Fast `SHOW_RESET` detection in the work loop automatically recovers configuration after ESD or watchdog events.
-- **Interrupt Reliability**: Drains pending active RDY line state on boot and resume to prevent missed rising-edge transitions.
-- **Hot-Path Log Demotion**: Demoted per-frame coordinate and gesture logs to `LOG_DBG` to eliminate serial/RTT bottlenecks.
-- **Zero-Delta Suppression**: Skips dispatching redundant relative input events when coordinate displacement is zero.
-- **Streamlined Suspend & Addressing**: Cleaned up suspend entry I2C transactions and relaxed hardcoded I2C address checks.
-
+On boot (and after any chip-detected reset), the driver holds RST, waits for firmware load, waits for the `SHOW_RESET` flag, sends `ACK_RESET`, writes the full configuration, and only then arms the RDY interrupt. The runtime work loop re-detects `SHOW_RESET` and reconfigures, self-healing from ESD/watchdog events. Robustness details — priority-inheriting `k_mutex`, immediate I2C window close, RDY drain on boot/resume, zero-delta suppression — are in the comments in [drivers/input/tps43.c](./drivers/input/tps43.c); see also [doc/develop.md](./doc/develop.md).
