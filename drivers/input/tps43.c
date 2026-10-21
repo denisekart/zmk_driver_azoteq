@@ -234,10 +234,21 @@ static void tps43_release_touch(const struct device *dev) {
     k_work_reschedule(&drv_data->touch_release_work, K_MSEC(TPS43_TOUCH_RELEASE_RETRY_MS));
 }
 
+/* Single exit funnel for the edge drag-continuation auto-slide.
+ * Caller must hold drv_data->lock. */
+static inline void tps43_slide_stop(struct tps43_drv_data *drv_data) {
+    k_work_cancel_delayable(&drv_data->slide_work);
+    drv_data->slide_pending = false;
+    drv_data->slide_active = false;
+}
+
 /* Tear down the touch session on I2C failure or chip reset: a dangling
  * TOUCH/BTN_0 release lost on the BLE hop pins the central's layer. */
 static void tps43_teardown_session(struct tps43_drv_data *drv_data) {
     const struct device *dev = drv_data->dev;
+
+    /* Auto-slide is drag-scoped: any session teardown ends it. */
+    tps43_slide_stop(drv_data);
 
     if (drv_data->touching) {
         tps43_release_touch(dev);
@@ -301,6 +312,8 @@ static int tps43_set_suspend_internal(const struct device *dev, bool suspend, bo
         if (drv_data->touching) {
             tps43_release_touch(dev);
         }
+
+        tps43_slide_stop(drv_data);
 
         if (drv_data->drag_active || drv_data->drag_continuation_active ||
             drv_data->drag_button_pressed) {
@@ -466,6 +479,106 @@ static inline bool tps43_is_near_edge(const struct tps43_config *config, uint16_
 
     return (x <= buf) || (x >= (max_x - buf)) ||
            (y <= buf) || (y >= (max_y - buf));
+}
+
+/* Edge drag-continuation auto-slide: motion-injection cadence. */
+#define TPS43_SLIDE_TICK_MS 20
+
+/* Integer sqrt for slide direction normalization (this Zephyr has no
+ * sys_sqrt32). Integer Newton, 4 iterations, floor-corrected. */
+static inline uint32_t tps43_isqrt32(uint32_t v) {
+    if (v == 0) {
+        return 0;
+    }
+    uint32_t x = 1U << ((31U - __builtin_clz(v) + 1) / 2);
+    for (int i = 0; i < 4; i++) {
+        x = (x + v / x) / 2;
+    }
+    while ((uint64_t)x * x > v) {
+        x--;
+    }
+    return x;
+}
+
+/**
+ * @brief Delayable work handler for the edge drag-continuation auto-slide
+ *
+ * One work serves both phases: the armed dwell timer (slide_pending)
+ * promotes to an active slide, then the self-rescheduling tick emits
+ * constant-speed relative motion away from the pad center along the
+ * vector toward the resting finger position. Mutex pattern mirrors
+ * tps43_drag_continuation_timeout.
+ */
+static void tps43_slide_work_handler(struct k_work *work) {
+    struct k_work_delayable *dwork = k_work_delayable_from_work(work);
+    struct tps43_drv_data *drv_data =
+        CONTAINER_OF(dwork, struct tps43_drv_data, slide_work);
+    const struct device *dev = drv_data->dev;
+    const struct tps43_config *config = dev->config;
+
+    if (k_mutex_lock(&drv_data->lock, K_MSEC(100)) != 0) {
+        /* Same 100 ms retry as the continuation timeout: no busy spin
+         * under sustained mutex contention. */
+        k_work_reschedule(&drv_data->slide_work, K_MSEC(100));
+        return;
+    }
+
+    if (drv_data->slide_pending) {
+        /* Dwell elapsed. */
+        if (!drv_data->drag_active) {
+            tps43_slide_stop(drv_data);
+            k_mutex_unlock(&drv_data->lock);
+            return;
+        }
+        drv_data->slide_pending = false;
+        drv_data->slide_active = true;
+        /* Fall through to emit the first tick. */
+    }
+
+    if (!drv_data->slide_active) {
+        k_mutex_unlock(&drv_data->lock);
+        return;
+    }
+
+    /* Stop when the drag is gone, a lift armed continuation, the finger
+     * count changed, or the buffer was left. */
+    if (!drv_data->drag_active || drv_data->drag_continuation_active ||
+        drv_data->prev_num_fingers != 1 ||
+        !tps43_is_near_edge(config, drv_data->last_abs_x, drv_data->last_abs_y)) {
+        tps43_slide_stop(drv_data);
+        k_mutex_unlock(&drv_data->lock);
+        return;
+    }
+
+    /* Direction = pad center -> resting ABS position (integer-normalized).
+     * Re-derived every tick, so steering within the buffer is immediate. */
+    int16_t max_x = (config->x_resolution > 0) ? config->x_resolution : 1024;
+    int16_t max_y = (config->y_resolution > 0) ? config->y_resolution : 1024;
+    if (config->switch_xy) {
+        swap(max_x, max_y);
+    }
+    int32_t dx = (int32_t)drv_data->last_abs_x - max_x / 2;
+    int32_t dy = (int32_t)drv_data->last_abs_y - max_y / 2;
+    uint32_t len = tps43_isqrt32((uint32_t)(dx * dx + dy * dy));
+    if (len == 0) {
+        /* Defensive: dead-center inside the buffer. Retry next tick. */
+        k_work_reschedule(&drv_data->slide_work, K_MSEC(TPS43_SLIDE_TICK_MS));
+        k_mutex_unlock(&drv_data->lock);
+        return;
+    }
+    int32_t spd = (int32_t)config->drag_continuation_slide_speed_pps *
+                  TPS43_SLIDE_TICK_MS / 1000;
+    int16_t sx = (int16_t)((dx * spd) / (int32_t)len);
+    int16_t sy = (int16_t)((dy * spd) / (int32_t)len);
+    if (sx != 0) {
+        input_report_rel(dev, INPUT_REL_X, sx, sy == 0, K_FOREVER);
+    }
+    if (sy != 0) {
+        input_report_rel(dev, INPUT_REL_Y, sy, true, K_FOREVER);
+    }
+
+    k_work_reschedule(&drv_data->slide_work, K_MSEC(TPS43_SLIDE_TICK_MS));
+    k_mutex_unlock(&drv_data->lock);
 }
 
 /**
@@ -641,6 +754,37 @@ static void tps43_work_handler(struct k_work *work) {
         drv_data->last_abs_y = (uint16_t)((touch_data[11] << 8) | touch_data[12]);
     }
 
+    /* Edge drag-continuation auto-slide gate. Runs before the
+     * continuation-resume block so slide bookkeeping stays ahead of the
+     * lift handling below. Stillness is measured on the ABS delta between
+     * consecutive reports, not REL: REL carries chip gesture deltas
+     * during an edge drag, the ABS delta is the literal "finger didn't
+     * move". */
+    if (drv_data->slide_enabled) {
+        int32_t move = abs32((int32_t)drv_data->last_abs_x -
+                             (int32_t)drv_data->slide_prev_abs_x) +
+                       abs32((int32_t)drv_data->last_abs_y -
+                             (int32_t)drv_data->slide_prev_abs_y);
+        drv_data->slide_prev_abs_x = drv_data->last_abs_x;
+        drv_data->slide_prev_abs_y = drv_data->last_abs_y;
+        bool slide_keep = is_drag_active && num_fingers == 1 &&
+                          move <= config->drag_continuation_slide_still_px &&
+                          tps43_is_near_edge(config, drv_data->last_abs_x,
+                                             drv_data->last_abs_y);
+        if (slide_keep) {
+            if (!drv_data->slide_active && !drv_data->slide_pending) {
+                drv_data->slide_pending = true;
+                k_work_reschedule(&drv_data->slide_work,
+                                  K_MSEC(config->drag_continuation_slide_dwell_ms));
+            }
+            /* Pending or active: leave the timer alone -- the dwell must
+             * elapse uninterrupted, and while active the self-rescheduling
+             * tick handles steering. */
+        } else if (drv_data->slide_pending || drv_data->slide_active) {
+            tps43_slide_stop(drv_data);
+        }
+    }
+
     /* In-loop self-healing and continuation resumption */
     if (drv_data->drag_continuation_active) {
         k_work_cancel_delayable(&drv_data->drag_continuation_work);
@@ -651,6 +795,7 @@ static void tps43_work_handler(struct k_work *work) {
             is_drag_active = true;
         } else {
             LOG_DBG("Continuation aborted by finger count (%d) -> Releasing button", num_fingers);
+            tps43_slide_stop(drv_data);
             drv_data->drag_continuation_active = false;
             drv_data->drag_active = false;
             is_drag_active = false;
@@ -834,6 +979,9 @@ static int tps43_reset_values(const struct device *dev) {
 
     k_work_cancel_delayable(&drv_data->drag_continuation_work);
     drv_data->drag_continuation_active = false;
+    k_work_cancel_delayable(&drv_data->slide_work);
+    drv_data->slide_pending = false;
+    drv_data->slide_active = false;
 
     if (drv_data->touching) {
         drv_data->touching = false;
@@ -1663,6 +1811,7 @@ static int tps43_init(const struct device *dev) {
     k_work_init_delayable(&drv_data->drag_continuation_work, tps43_drag_continuation_timeout);
     k_work_init_delayable(&drv_data->touch_release_work, tps43_touch_release_retry);
     k_work_init_delayable(&drv_data->reconfigure_work, tps43_reconfigure_work_handler);
+    k_work_init_delayable(&drv_data->slide_work, tps43_slide_work_handler);
 
     ret = tps43_reset_values(dev);
     if (ret != 0) {
@@ -1700,6 +1849,12 @@ static int tps43_init(const struct device *dev) {
     if (ret != 0) {
         LOG_ERR("Device configuration error: %d", ret);
         return ret;
+    }
+
+    drv_data->slide_enabled =
+        config->drag_continuation_slide && config->drag_continuation;
+    if (config->drag_continuation_slide && !config->drag_continuation) {
+        LOG_WRN("drag-continuation-slide requires drag-continuation - disabled");
     }
 
     drv_data->initialized = true;
@@ -1744,6 +1899,10 @@ static int tps43_init(const struct device *dev) {
         .drag_button_pressed = false,                                                                \
         .last_abs_x = 0,                                                                             \
         .last_abs_y = 0,                                                                             \
+        .slide_pending = false,                                                                        \
+        .slide_active = false,                                                                         \
+        .slide_prev_abs_x = 0,                                                                         \
+        .slide_prev_abs_y = 0,                                                                         \
         .suspended = false,                                                                          \
         .touching = false,                                                                           \
         .touch_session_fingers = 0,                                                                  \
@@ -1758,6 +1917,10 @@ static int tps43_init(const struct device *dev) {
         .drag_continuation = DT_INST_PROP_OR(inst, drag_continuation, false),                         \
         .drag_continuation_timeout_ms = DT_INST_PROP_OR(inst, drag_continuation_timeout_ms, 600),    \
         .drag_continuation_edge_buffer = DT_INST_PROP_OR(inst, drag_continuation_edge_buffer, 80),   \
+        .drag_continuation_slide = DT_INST_PROP_OR(inst, drag_continuation_slide, false),              \
+        .drag_continuation_slide_dwell_ms = DT_INST_PROP_OR(inst, drag_continuation_slide_dwell_ms, 250), \
+        .drag_continuation_slide_still_px = DT_INST_PROP_OR(inst, drag_continuation_slide_still_px, 12),  \
+        .drag_continuation_slide_speed_pps = DT_INST_PROP_OR(inst, drag_continuation_slide_speed_pps, 400), \
         .press_and_hold = DT_INST_PROP(inst, press_and_hold),                                        \
         .two_finger_tap = DT_INST_PROP(inst, two_finger_tap),                                        \
         .three_finger_tap = DT_INST_PROP(inst, three_finger_tap),                                    \

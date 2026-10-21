@@ -130,6 +130,43 @@ properties:
       Border width in coordinate pixels defining the edge continuation trigger zone
       (default: 80 px, ~8% of trackpad boundary on default 1024x1024 resolution).
 
+  drag-continuation-slide:
+    type: boolean
+    required: false
+    description: |
+      Auto-slide while dragging with a resting finger in the edge buffer.
+      Requires drag-continuation. The cursor slides away from the trackpad
+      center along the vector toward the resting finger position, at a
+      constant speed, after a dwell delay; direction follows the finger
+      instantly. Lifting falls through to normal lift-and-reposition
+      continuation.
+
+  drag-continuation-slide-dwell-ms:
+    type: int
+    required: false
+    default: 250
+    description: |
+      Still-in-buffer hold time in milliseconds required before sliding
+      starts. Any movement above the still threshold restarts it.
+
+  drag-continuation-slide-still-px:
+    type: int
+    required: false
+    default: 12
+    description: |
+      Per-report absolute-position movement at or below which the finger
+      counts as still (sum of absolute X and Y deltas).
+
+  drag-continuation-slide-speed:
+    type: int
+    required: false
+    default: 400
+    description: |
+      Slide speed in trackpad coordinate pixels per second (constant,
+      no ramp). Minimum effective value is 100 px/s (about 2 px per
+      20 ms tick; sub-pixel truncation stalls slower values on oblique
+      directions).
+
   two-finger-tap:
     type: boolean
     required: false

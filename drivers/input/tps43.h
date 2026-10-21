@@ -206,6 +206,10 @@ struct tps43_config {
     bool drag_continuation;
     int16_t drag_continuation_timeout_ms;
     int16_t drag_continuation_edge_buffer;
+    bool drag_continuation_slide;
+    int16_t drag_continuation_slide_dwell_ms;
+    int16_t drag_continuation_slide_still_px;
+    int16_t drag_continuation_slide_speed_pps;
     bool press_and_hold;
     bool two_finger_tap;
     bool three_finger_tap;
@@ -270,6 +274,7 @@ struct tps43_drv_data {
     struct gpio_callback rdy_cb;
     struct k_work work;
     struct k_work_delayable drag_continuation_work;
+    struct k_work_delayable slide_work;
     struct k_work_delayable touch_release_work;
     struct k_work_delayable reconfigure_work;
 
@@ -279,6 +284,11 @@ struct tps43_drv_data {
     bool drag_button_pressed;
     uint16_t last_abs_x;
     uint16_t last_abs_y;
+    bool slide_enabled;     /* config gate ANDed with drag_continuation at init */
+    bool slide_pending;     /* dwell armed, waiting to start */
+    bool slide_active;      /* injecting motion */
+    uint16_t slide_prev_abs_x; /* previous-event ABS, stillness metric */
+    uint16_t slide_prev_abs_y;
     bool suspended;
     bool touching;
     int64_t last_three_finger_swipe_ms;
