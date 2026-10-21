@@ -21,8 +21,9 @@ properties:
       - Bit 2 (0x04): IIR select - When set, uses fixed IIR coefficient.
         When clear (default), uses dynamic IIR that adapts to movement speed.
       - Bit 3 (0x08): ALP count filter - Adaptive Learning Process filter
-        for noise suppression. Filters unwanted touch events based on learned patterns.
-      
+        for noise suppression. Filters unwanted touch events based on
+        learned patterns.
+
       Common configurations:
       - 0x0B: IIR + MAV + ALP enabled, dynamic IIR.
         Good balance of stability and responsiveness.
@@ -31,9 +32,9 @@ properties:
       - 0x03: IIR + MAV only. Basic smoothing without ALP filtering.
       - 0x01: IIR only. Minimal filtering, lowest latency.
       - 0x00: All filters disabled. Raw sensor data, may have noise.
-      
+
       Values can be combined using bitwise OR (e.g., 0x01 | 0x02 = 0x03).
-      
+
   filter-dynamic-bottom:
     type: int
     required: false
@@ -47,7 +48,7 @@ properties:
     type: int
     required: false
     description: |
-      XY dynamic filter lower speed threshold 
+      XY dynamic filter lower speed threshold
       Defines the speed below which the bottom beta filter coefficient is used.
       Only written if explicitly set.
 
@@ -55,7 +56,7 @@ properties:
     type: int
     required: false
     description: |
-      XY dynamic filter upper speed threshold 
+      XY dynamic filter upper speed threshold
       Defines the speed above which maximum filtering is applied.
       Only written if explicitly set.
 
@@ -79,19 +80,22 @@ properties:
     type: int
     required: false
     default: 100
-    description: Touch sensitivity percentage (100 = normal, higher = more sensitive)
+    description: >
+      Touch sensitivity percentage (100 = normal, higher = more sensitive).
 
   scroll-sensitivity:
     type: int
     required: false
     default: 100
-    description: Scroll sensitivity percentage (100 = normal, higher = more sensitive)
+    description: >
+      Scroll sensitivity percentage (100 = normal, higher = more sensitive).
 
   zoom-sensitivity:
     type: int
     required: false
     default: 100
-    description: Zoom sensitivity percentage (100 = normal, higher = more sensitive)
+    description: >
+      Zoom sensitivity percentage (100 = normal, higher = more sensitive).
 
   enable-power-management:
     type: boolean
@@ -117,18 +121,21 @@ properties:
     description: Enable edge drag continuation with lift-and-reposition support.
 
   drag-continuation-timeout-ms:
-    type: int 
+    type: int
     required: false
     default: 600
-    description: Maximum lift time in milliseconds allowed to reposition finger during edge drag.
+    description: >
+      Maximum lift time in milliseconds allowed to reposition finger
+      during edge drag.
 
   drag-continuation-edge-buffer:
     type: int
     required: false
     default: 80
     description: >
-      Border width in coordinate pixels defining the edge continuation trigger zone
-      (default: 80 px, ~8% of trackpad boundary on default 1024x1024 resolution).
+      Border width in coordinate pixels defining the edge continuation
+      trigger zone (default: 80 px, ~8% of trackpad boundary on
+      default 1024x1024 resolution).
 
   drag-continuation-slide:
     type: boolean
@@ -193,25 +200,30 @@ properties:
   swipes:
     type: boolean
     required: false
-    description: Enable swipe processing. When enabled, tracks swipes as INPUT_BTN_NORTH/SOUTH/EAST/WEST.
+    description: >
+      Enable swipe processing. When enabled, tracks swipes as
+      INPUT_BTN_NORTH/SOUTH/EAST/WEST.
 
   three-finger-swipe:
     type: boolean
     required: false
     description: >
-      Enable three-finger-only swipe processing, tracked as INPUT_BTN_NORTH/SOUTH/EAST/WEST.
-      Independent of `swipes`, so a three-finger swipe can be enabled without also enabling
-      single-finger swipe.
+      Enable three-finger-only swipe processing, tracked as
+      INPUT_BTN_NORTH/SOUTH/EAST/WEST.
+      Independent of `swipes`, so a three-finger swipe can be enabled
+      without also enabling single-finger swipe.
 
   three-finger-swipe-throttle-ms:
     type: int
     required: false
     default: 300
     description: >
-      Minimum time in milliseconds between consecutive three-finger swipe actuations.
+      Minimum time in milliseconds between consecutive three-finger swipe
+      actuations.
       Unlike the single-finger swipe (a single hardware-gated gesture event), a
-      three-finger swipe is derived from raw movement deltas reported on every touch
-      update while 3 fingers are down, so a single continuous swipe motion can otherwise
+      three-finger swipe is derived from raw movement deltas reported on
+      every touch update while 3 fingers are down, so a single
+      continuous swipe motion can otherwise
       fire the gesture many times in a row. Set to 0 to disable throttling.
 
   switch-xy:
@@ -227,7 +239,7 @@ properties:
   invert-x:
     type: boolean
     description: If present, invert X coordinate values.
-      
+
   invert-y:
     type: boolean
     description: If present, invert Y coordinate values.
@@ -235,7 +247,7 @@ properties:
   invert-scroll-x:
     type: boolean
     description: If present, invert X scroll values.
-            
+
   invert-scroll-y:
     type: boolean
     description: If present, invert Y scroll values.
@@ -328,7 +340,8 @@ properties:
     required: false
     description: |
       ATI target value (2 bytes).
-      Sets the target count for the ATI (Automatic Tuning Implementation) process.
+      Sets the target count for the ATI (Automatic Tuning
+      Implementation) process.
       Written to the ATI_TARGET register (0x056D).
       Only written if explicitly set.
 
@@ -337,7 +350,8 @@ properties:
     required: false
     description: |
       ATI reference drift limit (1 byte).
-      Controls the allowed drift of the reference level before re-ATI is triggered.
+      Controls the allowed drift of the reference level before re-ATI is
+      triggered.
       Written to the REF_DRIFT_LIMIT register (0x0571).
       Only written if explicitly set.
 
@@ -451,7 +465,8 @@ properties:
     type: int
     required: false
     description: |
-      Timeout for low-power mode 1 in 20 sec units (1 byte). i.e. 3 means 60 seconds.
+      Timeout for low-power mode 1 in 20 sec units (1 byte).
+      i.e. 3 means 60 seconds.
       Time before transitioning from LP1 to LP2 mode.
       Written to the TIMEOUT_LP1 register (0x0587).
       Only written if explicitly set.
@@ -470,7 +485,8 @@ properties:
     required: false
     description: |
       Maximum time for a tap gesture in milliseconds (2 bytes).
-      Sets the maximum duration a finger can be in contact for a tap to register.
+      Sets the maximum duration a finger can be in contact for a tap to
+      register.
       Written to the TAP_TIME register (0x06B9).
       Only written if explicitly set.
 
