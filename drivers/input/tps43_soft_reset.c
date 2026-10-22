@@ -1,7 +1,7 @@
 /*
  * Global soft-reset behavior for the Azoteq TPS43 trackpad setup.
  *
- * Bound via a leader sequence (e.g. <leader> Z Z Z), the behavior restores
+ * Bound via a leader sequence (e.g. <leader> T T T), the behavior restores
  * the input stack to a power-on-fresh state in one press. As a
  * BEHAVIOR_LOCALITY_GLOBAL binding it is invoked locally on the central AND
  * forwarded to every peripheral before that, so each firmware runs its
