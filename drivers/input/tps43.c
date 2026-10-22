@@ -1978,7 +1978,7 @@ static int tps43_init(const struct device *dev) {
         .drag_continuation_slide = DT_INST_PROP_OR(inst, drag_continuation_slide, false),              \
         .drag_continuation_slide_dwell_ms = DT_INST_PROP_OR(inst, drag_continuation_slide_dwell_ms, 250), \
         .drag_continuation_slide_still_px = DT_INST_PROP_OR(inst, drag_continuation_slide_still_px, 12),  \
-        .drag_continuation_slide_speed_pps = DT_INST_PROP_OR(inst, drag_continuation_slide_speed_pps, 400), \
+        .drag_continuation_slide_speed_pps = DT_INST_PROP_OR(inst, drag_continuation_slide_speed, 400), \
         .press_and_hold = DT_INST_PROP(inst, press_and_hold),                                        \
         .two_finger_tap = DT_INST_PROP(inst, two_finger_tap),                                        \
         .three_finger_tap = DT_INST_PROP(inst, three_finger_tap),                                    \
